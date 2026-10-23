@@ -44,6 +44,8 @@ export function App() {
     mtp_policy: 'survival',
     prompt_lookup: true,
     api_key: '',
+    auto_open_gui: true,
+    auto_start_server: false,
   });
 
   const [logs, setLogs] = useState<string[]>([]);
@@ -64,7 +66,7 @@ export function App() {
               !parsed.gufo_path.includes('D:\\Agents\\gufo') &&
               !parsed.gufo_path.includes('D:/Agents/gufo')
             ) {
-              setConfig(parsed);
+              setConfig({ ...defaultCfg, ...parsed });
             } else {
               setConfig(defaultCfg);
               localStorage.setItem('gufo_studio_config', JSON.stringify(defaultCfg));

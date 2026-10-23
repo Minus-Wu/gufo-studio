@@ -29,6 +29,14 @@ pub struct GufoServerConfig {
     pub prompt_lookup: bool,
     #[serde(default)]
     pub api_key: String,
+    #[serde(default = "default_auto_open_gui")]
+    pub auto_open_gui: bool,
+    #[serde(default)]
+    pub auto_start_server: bool,
+}
+
+fn default_auto_open_gui() -> bool {
+    true
 }
 
 impl Default for GufoServerConfig {
@@ -113,6 +121,8 @@ impl Default for GufoServerConfig {
             mtp_policy: "survival".to_string(),
             prompt_lookup: true,
             api_key: String::new(),
+            auto_open_gui: true,
+            auto_start_server: false,
         }
     }
 }
@@ -570,6 +580,8 @@ mod tests {
         assert_eq!(config.mtp_policy, "survival");
         assert!(config.prompt_lookup);
         assert_eq!(config.api_key, "");
+        assert!(config.auto_open_gui);
+        assert!(!config.auto_start_server);
 
         // 預設路徑應為相對工作目錄，不應寫死 D:\Agents 或 D:\Models
         assert!(!config.gufo_path.starts_with(r"D:\Agents\gufo"));

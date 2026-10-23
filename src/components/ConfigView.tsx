@@ -12,6 +12,7 @@ import {
   EyeOff,
   Sparkles,
   FolderOpen,
+  SlidersHorizontal,
 } from 'lucide-react';
 import { GufoServerConfig } from '../types';
 
@@ -290,6 +291,77 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                 <span>瀏覽...</span>
               </button>
             </div>
+          </div>
+        </div>
+      </div>
+
+      {/* 系統啟動偏好設定卡片 */}
+      <div className="config-card">
+        <div className="card-title">
+          <SlidersHorizontal size={18} color="#10b981" />
+          <span>系統啟動偏好設定 (Startup Preferences)</span>
+        </div>
+        <div className="card-subtitle">
+          設定應用程式啟動時的視窗顯示與背景推論伺服器自動啟動行為。
+        </div>
+
+        <div className="form-grid single-col" style={{ gap: 12 }}>
+          {/* 啟動後是否自動開啟 GUI */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '12px 16px',
+              backgroundColor: 'var(--bg-primary)',
+              borderRadius: 'var(--radius-sm)',
+              border: '1px solid var(--border-color)',
+            }}
+          >
+            <div>
+              <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--text-primary)' }}>
+                啟動後自動顯示主視窗 (Open GUI on Startup)
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
+                預設開啟。若關閉，應用程式啟動時將自動縮小隱藏於系統匣 (Tray)，點擊系統匣圖示即可隨時喚出主視窗。
+              </div>
+            </div>
+            <input
+              type="checkbox"
+              style={{ width: 18, height: 18, cursor: 'pointer', accentColor: '#10b981' }}
+              checked={form.auto_open_gui}
+              disabled={isRunning}
+              onChange={(e) => handleChange('auto_open_gui', e.target.checked)}
+            />
+          </div>
+
+          {/* 啟動後是否自動啟動伺服器 */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '12px 16px',
+              backgroundColor: 'var(--bg-primary)',
+              borderRadius: 'var(--radius-sm)',
+              border: '1px solid var(--border-color)',
+            }}
+          >
+            <div>
+              <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--text-primary)' }}>
+                啟動後自動開啟推論伺服器 (Auto-start Server on Startup)
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
+                應用程式啟動完成後，立即自動加載指定模型並在背景運行 Gufo 推理引擎 (Port {form.port})。
+              </div>
+            </div>
+            <input
+              type="checkbox"
+              style={{ width: 18, height: 18, cursor: 'pointer', accentColor: '#10b981' }}
+              checked={form.auto_start_server}
+              disabled={isRunning}
+              onChange={(e) => handleChange('auto_start_server', e.target.checked)}
+            />
           </div>
         </div>
       </div>

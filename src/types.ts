@@ -18,6 +18,8 @@ export interface GufoServerConfig {
   mtp_policy: 'survival' | 'length';
   prompt_lookup: boolean;
   api_key: string;
+  auto_open_gui: boolean;
+  auto_start_server: boolean;
 }
 
 export interface ServerStatus {

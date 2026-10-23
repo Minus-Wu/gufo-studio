@@ -25,10 +25,17 @@ pub fn run() {
             // 初始化系統匣 (Tray Icon)
             tray::setup_tray(app.handle())?;
 
+            let initial_config = gufo_manager::GufoManager::load_saved_config().unwrap_or_default();
+
             // 監聽視窗關閉事件：關閉時隱藏視窗至 Tray，而非直接退出
             if let Some(window) = app.get_webview_window("main") {
                 // 啟動時還原上次關閉時的位置與尺寸，若超出螢幕則移動至第一個螢幕
                 window_state::restore_window_state(&window);
+
+                // 若設定不自動開啟 GUI，則啟動後自動隱藏至系統匣 (Tray)
+                if !initial_config.auto_open_gui {
+                    let _ = window.hide();
+                }
 
                 let win_clone = window.clone();
                 window.on_window_event(move |event| {
@@ -45,6 +52,18 @@ pub fn run() {
                         }
                         _ => {}
                     }
+                });
+            }
+
+            // 檢查是否啟動後自動啟動推論伺服器
+            if initial_config.auto_start_server {
+                let app_handle = app.handle().clone();
+                let state = app.state::<AppState>();
+                let manager_clone = state.manager.clone();
+                tokio::spawn(async move {
+                    // 稍微延遲 300ms 確保系統匣與事件通道就緒
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let _ = manager_clone.start(app_handle, None).await;
                 });
             }
 
