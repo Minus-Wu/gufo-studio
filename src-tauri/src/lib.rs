@@ -39,6 +39,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_default_config,
+            commands::save_config,
             commands::get_server_status,
             commands::start_server,
             commands::stop_server,

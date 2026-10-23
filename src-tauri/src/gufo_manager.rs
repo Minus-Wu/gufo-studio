@@ -31,18 +31,41 @@ pub struct GufoServerConfig {
 
 impl Default for GufoServerConfig {
     fn default() -> Self {
-        // 預設檢查常用的 Gufo 本機路徑
-        let default_gufo = if std::path::Path::new(r"D:\Agents\gufo\build\release\gufo.exe").exists() {
-            r"D:\Agents\gufo\build\release\gufo.exe".to_string()
-        } else if std::path::Path::new(r"C:\gufo\gufo.exe").exists() {
-            r"C:\gufo\gufo.exe".to_string()
-        } else if std::path::Path::new("gufo.exe").exists() {
-            "gufo.exe".to_string()
-        } else {
-            r"D:\Agents\gufo\build\release\gufo.exe".to_string()
-        };
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
 
-        let default_model_dir = PathBuf::from(r"D:\Models\GGUF\Qwen3.8-Flash-Next-GGUF");
+        // 優先尋找同目錄或便攜目錄下的 gufo.exe
+        let gufo_candidates = [
+            exe_dir.join("gufo.exe"),
+            exe_dir.join("bin").join("gufo.exe"),
+            exe_dir.join("build").join("release").join("gufo.exe"),
+            PathBuf::from(r"D:\Agents\gufo\build\release\gufo.exe"),
+            PathBuf::from(r"C:\gufo\gufo.exe"),
+            PathBuf::from("gufo.exe"),
+        ];
+
+        let default_gufo = gufo_candidates
+            .iter()
+            .find(|p| p.exists())
+            .unwrap_or(&gufo_candidates[3])
+            .to_string_lossy()
+            .to_string();
+
+        // 優先尋找同目錄或預設模型目錄
+        let model_dir_candidates = [
+            exe_dir.join("models").join("Qwen3.8-Flash-Next-GGUF"),
+            exe_dir.parent().map(|p| p.join("models").join("Qwen3.8-Flash-Next-GGUF")).unwrap_or_else(|| PathBuf::from(".")),
+            PathBuf::from(r"D:\Models\GGUF\Qwen3.8-Flash-Next-GGUF"),
+            PathBuf::from(r"C:\gufo\models\Qwen3.8-Flash-Next-GGUF"),
+        ];
+
+        let default_model_dir = model_dir_candidates
+            .iter()
+            .find(|p| p.exists())
+            .unwrap_or(&model_dir_candidates[2]);
+
         let model_file = default_model_dir.join("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf");
         let mtp_file = default_model_dir.join("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf");
         let vision_file = default_model_dir.join("mmproj-BF16.gguf");
@@ -100,14 +123,43 @@ pub struct GufoManager {
 
 impl GufoManager {
     pub fn new() -> Self {
+        let initial_config = Self::load_saved_config().unwrap_or_default();
         Self {
             child: Arc::new(Mutex::new(None)),
-            config: Arc::new(Mutex::new(GufoServerConfig::default())),
+            config: Arc::new(Mutex::new(initial_config)),
             state: Arc::new(Mutex::new(ServerStateEnum::Stopped)),
             start_time: Arc::new(Mutex::new(None)),
             error_message: Arc::new(Mutex::new(None)),
             recent_logs: Arc::new(Mutex::new(VecDeque::with_capacity(1000))),
         }
+    }
+
+    fn get_config_file_path() -> PathBuf {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+        exe_dir.join("gufo-studio.config.json")
+    }
+
+    pub fn load_saved_config() -> Option<GufoServerConfig> {
+        let path = Self::get_config_file_path();
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(cfg) = serde_json::from_str::<GufoServerConfig>(&content) {
+                    return Some(cfg);
+                }
+            }
+        }
+        None
+    }
+
+    pub async fn save_config(&self, cfg: GufoServerConfig) -> Result<(), String> {
+        *self.config.lock().await = cfg.clone();
+        let path = Self::get_config_file_path();
+        let json = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+        std::fs::write(&path, json).map_err(|e| format!("無法寫入設定檔 {}: {}", path.display(), e))?;
+        Ok(())
     }
 
     pub async fn get_config(&self) -> GufoServerConfig {

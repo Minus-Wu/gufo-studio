@@ -59,12 +59,20 @@ pnpm install
 pnpm tauri dev
 ```
 
-### 建置正式發行版本
+### 建置單一執行檔便攜版 (Standalone Portable EXE)
+本專案支援將前端 Web 介面完整靜態內嵌至單一二進制檔案中，免安裝即可直接執行：
+```powershell
+pnpm build:portable
+```
+打包完成後將直接產出 `dist-portable/gufo-studio.exe`：
+- **隨處可跑**：可直接將 `gufo-studio.exe` 拷貝放置於 Gufo 的 Release 資料夾（例如與 `gufo.exe` 同目錄）。
+- **自動偵測**：啟動時自動探索同目錄或鄰近目錄的 `gufo.exe` 與 `models/Qwen3.8-Flash-Next-GGUF`。
+- **便攜設定**：設定將自動持久化於同目錄下的 `gufo-studio.config.json`，隨身碟即插即用。
+
+### 建置正式發行安裝包
 ```powershell
 pnpm tauri build
 ```
-
-建置產物將輸出至 `src-tauri/target/release/gufo-studio.exe`。
 
 ---
 

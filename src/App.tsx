@@ -125,10 +125,15 @@ export function App() {
     }
   };
 
-  // 保存設定
-  const handleSaveConfig = (newConfig: GufoServerConfig) => {
+  // 保存設定（同時寫入前端 LocalStorage 與後端便攜設定檔 gufo-studio.config.json）
+  const handleSaveConfig = async (newConfig: GufoServerConfig) => {
     setConfig(newConfig);
     localStorage.setItem('gufo_studio_config', JSON.stringify(newConfig));
+    try {
+      await invoke('save_config', { config: newConfig });
+    } catch (e) {
+      console.warn('無法儲存設定檔到磁碟:', e);
+    }
   };
 
   // 還原預設配置

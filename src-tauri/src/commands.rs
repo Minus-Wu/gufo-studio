@@ -8,6 +8,14 @@ pub async fn get_default_config(state: State<'_, AppState>) -> Result<GufoServer
 }
 
 #[tauri::command]
+pub async fn save_config(
+    state: State<'_, AppState>,
+    config: GufoServerConfig,
+) -> Result<(), String> {
+    state.manager.save_config(config).await
+}
+
+#[tauri::command]
 pub async fn get_server_status(state: State<'_, AppState>) -> Result<ServerStatus, String> {
     Ok(state.manager.get_status().await)
 }

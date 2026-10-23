@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:portable": "node scripts/build-portable.mjs",
+    "build:single": "node scripts/build-portable.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
