@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { MessageSquare, Settings, Terminal, Play, Square, Copy, Check } from 'lucide-react';
+import { MessageSquare, Settings, Terminal, Play, Square, Copy, Check, Lock } from 'lucide-react';
 import { ServerStatus } from '../types';
 
 interface HeaderProps {
@@ -72,11 +72,16 @@ export const Header: React.FC<HeaderProps> = ({
       <div className="header-actions">
         <div
           className="server-badge"
-          title={`點擊複製 OpenAI API 端點：${status.endpoint}`}
+          title={`點擊複製 OpenAI API 端點：${status.endpoint}${status.api_key ? ' (已啟用 API Key 保護)' : ''}`}
           onClick={handleCopyEndpoint}
           style={{ cursor: 'pointer' }}
         >
           <span className={`status-dot ${status.state}`} />
+          {status.api_key && (
+            <span title="API Key 保護已啟用" style={{ display: 'flex', alignItems: 'center' }}>
+              <Lock size={12} color="#10b981" />
+            </span>
+          )}
           <span>
             {status.state === 'running'
               ? `Port ${status.port} (${formatUptime(status.uptime_secs)})`

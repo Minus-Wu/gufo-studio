@@ -156,9 +156,16 @@ export const ChatView: React.FC<ChatViewProps> = ({ status, onStartServer }) => 
     let tokenCount = 0;
 
     try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (status.api_key) {
+        headers['Authorization'] = `Bearer ${status.api_key}`;
+      }
+
       const response = await fetch(`${status.endpoint}/chat/completions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           model: status.served_model_name || 'flash-next',
           messages: apiMessages,

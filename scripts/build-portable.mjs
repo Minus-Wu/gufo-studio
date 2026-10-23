@@ -33,6 +33,13 @@ if (!fs.existsSync(sourceExe)) {
   process.exit(1);
 }
 
+// 若有舊進程佔用目標檔案，先嘗試停止
+try {
+  execSync('taskkill /F /IM gufo-studio.exe', { stdio: 'ignore' });
+} catch {
+  // 忽略未運行的情況
+}
+
 fs.copyFileSync(sourceExe, targetExe);
 
 const stats = fs.statSync(targetExe);

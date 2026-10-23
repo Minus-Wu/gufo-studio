@@ -43,6 +43,7 @@ export function App() {
     speculative: 'mtp',
     mtp_policy: 'survival',
     prompt_lookup: true,
+    api_key: '',
   });
 
   const [logs, setLogs] = useState<string[]>([]);

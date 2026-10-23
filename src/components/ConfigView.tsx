@@ -1,6 +1,17 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Save, RotateCcw, CheckCircle2, AlertCircle, HardDrive, Cpu } from 'lucide-react';
+import {
+  Save,
+  RotateCcw,
+  CheckCircle2,
+  AlertCircle,
+  HardDrive,
+  Cpu,
+  Shield,
+  Eye,
+  EyeOff,
+  Sparkles,
+} from 'lucide-react';
 import { GufoServerConfig } from '../types';
 
 interface ConfigViewProps {
@@ -19,6 +30,14 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
   const [form, setForm] = useState<GufoServerConfig>(initialConfig);
   const [pathStatus, setPathStatus] = useState<{ [key: string]: boolean }>({});
   const [savedSuccess, setSavedSuccess] = useState(false);
+  const [showApiKey, setShowApiKey] = useState(false);
+
+  const generateApiKey = () => {
+    const randomHex = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+    handleChange('api_key', `sk-gufo-${randomHex}`);
+  };
 
   useEffect(() => {
     setForm(initialConfig);
@@ -274,6 +293,73 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
               <option value="on">on (開啟深度推導思考)</option>
               <option value="auto">auto (自動遵循模型提示)</option>
             </select>
+          </div>
+
+          {/* API Key 安全保護 */}
+          <div className="form-group" style={{ gridColumn: 'span 2' }}>
+            <div className="form-label">
+              <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <Shield size={14} color="#10b981" />
+                <span>API Key 金鑰保護 (Authorization Bearer Token)</span>
+              </span>
+              <span style={{ fontSize: 11, color: '#94a3b8' }}>
+                {form.api_key ? '已啟用金鑰驗證' : '留空表示無金鑰限制'}
+              </span>
+            </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <div style={{ position: 'relative', flex: 1 }}>
+                <input
+                  type={showApiKey ? 'text' : 'password'}
+                  className="form-input"
+                  style={{ width: '100%', paddingRight: 36 }}
+                  placeholder="可選，例如 sk-gufo-xxx (留空表示不限制存取)"
+                  value={form.api_key || ''}
+                  disabled={isRunning}
+                  onChange={(e) => handleChange('api_key', e.target.value)}
+                />
+                <button
+                  type="button"
+                  style={{
+                    position: 'absolute',
+                    right: 8,
+                    top: '50%',
+                    transform: 'translateY(-50%)',
+                    background: 'transparent',
+                    border: 'none',
+                    color: '#94a3b8',
+                    cursor: 'pointer',
+                  }}
+                  onClick={() => setShowApiKey(!showApiKey)}
+                  title={showApiKey ? '隱藏金鑰' : '顯示金鑰'}
+                >
+                  {showApiKey ? <EyeOff size={15} /> : <Eye size={15} />}
+                </button>
+              </div>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                disabled={isRunning}
+                onClick={generateApiKey}
+                title="隨機生成高強度金鑰"
+              >
+                <Sparkles size={13} color="#06b6d4" />
+                <span>隨機生成</span>
+              </button>
+              {form.api_key && (
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  disabled={isRunning}
+                  onClick={() => handleChange('api_key', '')}
+                  title="清除金鑰"
+                >
+                  <span>清除</span>
+                </button>
+              )}
+            </div>
+            <div style={{ fontSize: 11.5, color: '#64748b', marginTop: 2 }}>
+              若設定 API Key，外部或本地客戶端（如 Open WebUI, Cursor, VS Code 等）向 <code>http://127.0.0.1:12223/v1</code> 發出請求時，皆必須攜帶 <code>Authorization: Bearer &lt;KEY&gt;</code> 標頭。
+            </div>
           </div>
         </div>
 

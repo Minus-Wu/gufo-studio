@@ -27,6 +27,8 @@ pub struct GufoServerConfig {
     pub speculative: String, // "mtp", "dflash2", "off"
     pub mtp_policy: String,  // "survival", "length"
     pub prompt_lookup: bool,
+    #[serde(default)]
+    pub api_key: String,
 }
 
 impl Default for GufoServerConfig {
@@ -87,6 +89,7 @@ impl Default for GufoServerConfig {
             speculative: "mtp".to_string(),
             mtp_policy: "survival".to_string(),
             prompt_lookup: true,
+            api_key: String::new(),
         }
     }
 }
@@ -110,6 +113,7 @@ pub struct ServerStatus {
     pub endpoint: String,
     pub uptime_secs: u64,
     pub error_message: Option<String>,
+    pub api_key: Option<String>,
 }
 
 pub struct GufoManager {
@@ -188,6 +192,11 @@ impl GufoManager {
             endpoint: format!("http://{}:{}/v1", cfg.host, cfg.port),
             uptime_secs: uptime,
             error_message: err,
+            api_key: if cfg.api_key.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.api_key.trim().to_string())
+            },
         }
     }
 
@@ -251,6 +260,11 @@ impl GufoManager {
             "--temperature".to_string(),
             cfg.temperature.to_string(),
         ];
+
+        if !cfg.api_key.trim().is_empty() {
+            args.push("--api-key".to_string());
+            args.push(cfg.api_key.trim().to_string());
+        }
 
         if cfg.speculative == "mtp" && !cfg.mtp_path.is_empty() && std::path::Path::new(&cfg.mtp_path).exists() {
             args.push("--speculative".to_string());
@@ -342,6 +356,7 @@ impl GufoManager {
         let state_clone = self.state.clone();
         let host = cfg.host.clone();
         let port = cfg.port;
+        let api_key = cfg.api_key.trim().to_string();
         let app_clone3 = app.clone();
         tokio::spawn(async move {
             let client = reqwest::Client::builder()
@@ -353,7 +368,11 @@ impl GufoManager {
             // 每 1 秒檢查一次，最多嘗試 60 次
             for _ in 0..60 {
                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                if let Ok(resp) = client.get(&url).send().await {
+                let mut req = client.get(&url);
+                if !api_key.is_empty() {
+                    req = req.bearer_auth(&api_key);
+                }
+                if let Ok(resp) = req.send().await {
                     if resp.status().is_success() {
                         *state_clone.lock().await = ServerStateEnum::Running;
                         let _ = app_clone3.emit("gufo-status-changed", "running");
@@ -395,7 +414,11 @@ impl GufoManager {
             .build()
             .unwrap_or_default();
         let url = format!("http://{}:{}/v1/models", cfg.host, cfg.port);
-        match client.get(&url).send().await {
+        let mut req = client.get(&url);
+        if !cfg.api_key.trim().is_empty() {
+            req = req.bearer_auth(cfg.api_key.trim());
+        }
+        match req.send().await {
             Ok(resp) => resp.status().is_success(),
             Err(_) => false,
         }
@@ -427,6 +450,14 @@ mod tests {
         assert_eq!(config.speculative, "mtp");
         assert_eq!(config.mtp_policy, "survival");
         assert!(config.prompt_lookup);
+        assert_eq!(config.api_key, "");
+    }
+
+    #[tokio::test]
+    async fn test_api_key_configuration() {
+        let mut config = GufoServerConfig::default();
+        config.api_key = "sk-gufo-secret-key-123".to_string();
+        assert_eq!(config.api_key, "sk-gufo-secret-key-123");
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@ export interface GufoServerConfig {
   speculative: 'mtp' | 'dflash2' | 'off';
   mtp_policy: 'survival' | 'length';
   prompt_lookup: boolean;
+  api_key: string;
 }
 
 export interface ServerStatus {
@@ -28,6 +29,7 @@ export interface ServerStatus {
   endpoint: string;
   uptime_secs: number;
   error_message: string | null;
+  api_key?: string;
 }
 
 export interface MessageImage {

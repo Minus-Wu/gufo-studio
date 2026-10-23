@@ -32,7 +32,12 @@
      - 視覺側車側載（`--mmproj mmproj-BF16.gguf`）
      - 零採樣貪婪解碼（`--temperature 0 --think off`）
 
-4. **即時日誌流與狀態儀表板 (Live Logs & Dashboard)**：
+4. **API Key 安全金鑰保護 (Authorization Bearer Token)**：
+   - 支援原生 `--api-key <KEY>` 伺服器安全機制。
+   - 提供圖形化密碼顯示/隱藏切換、隨機高強度金鑰生成（`sk-gufo-...`）。
+   - 保障區域網路（LAN）或本機服務存取安全，內建 Chat 介面與健康檢查探測自動附加金鑰。
+
+5. **即時日誌流與狀態儀表板 (Live Logs & Dashboard)**：
    - 即時捕捉 Gufo 的 stdout / stderr。
    - 查看 AMD ROCm 初始化、GPU VRAM 記憶體佔用與模型分塊進度。
 
