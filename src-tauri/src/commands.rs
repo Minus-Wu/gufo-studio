@@ -46,5 +46,23 @@ pub async fn get_recent_logs(state: State<'_, AppState>) -> Result<Vec<String>, 
 
 #[tauri::command]
 pub fn check_path_exists(path: String) -> bool {
-    std::path::Path::new(&path).exists()
+    let p = std::path::Path::new(&path);
+    if p.exists() {
+        return true;
+    }
+    if p.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            if cwd.join(p).exists() {
+                return true;
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                if parent.join(p).exists() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }

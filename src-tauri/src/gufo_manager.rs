@@ -33,50 +33,73 @@ pub struct GufoServerConfig {
 
 impl Default for GufoServerConfig {
     fn default() -> Self {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."));
 
-        // 優先尋找同目錄或便攜目錄下的 gufo.exe
+        // 工作目錄下尋找 gufo.exe 的相對候選
         let gufo_candidates = [
-            exe_dir.join("gufo.exe"),
-            exe_dir.join("bin").join("gufo.exe"),
-            exe_dir.join("build").join("release").join("gufo.exe"),
-            PathBuf::from(r"D:\Agents\gufo\build\release\gufo.exe"),
-            PathBuf::from(r"C:\gufo\gufo.exe"),
-            PathBuf::from("gufo.exe"),
+            r"gufo.exe",
+            r"build\release\gufo.exe",
+            r"bin\gufo.exe",
         ];
 
         let default_gufo = gufo_candidates
             .iter()
-            .find(|p| p.exists())
-            .unwrap_or(&gufo_candidates[3])
-            .to_string_lossy()
-            .to_string();
+            .find(|rel| cwd.join(rel).exists() || exe_dir.join(rel).exists())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                if cwd.join(r"build\release\gufo.exe").exists() || exe_dir.join(r"build\release\gufo.exe").exists() {
+                    r"build\release\gufo.exe".to_string()
+                } else {
+                    r"gufo.exe".to_string()
+                }
+            });
 
-        // 優先尋找同目錄或預設模型目錄
+        // 工作目錄下尋找模型目錄的相對候選
         let model_dir_candidates = [
-            exe_dir.join("models").join("Qwen3.8-Flash-Next-GGUF"),
-            exe_dir.parent().map(|p| p.join("models").join("Qwen3.8-Flash-Next-GGUF")).unwrap_or_else(|| PathBuf::from(".")),
-            PathBuf::from(r"D:\Models\GGUF\Qwen3.8-Flash-Next-GGUF"),
-            PathBuf::from(r"C:\gufo\models\Qwen3.8-Flash-Next-GGUF"),
+            r"models\Qwen3.8-Flash-Next-GGUF",
+            r"models",
+            r"",
         ];
 
-        let default_model_dir = model_dir_candidates
+        let chosen_model_dir = model_dir_candidates
             .iter()
-            .find(|p| p.exists())
-            .unwrap_or(&model_dir_candidates[2]);
+            .find(|rel| {
+                let test_path = if rel.is_empty() {
+                    PathBuf::from("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf")
+                } else {
+                    PathBuf::from(rel).join("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf")
+                };
+                cwd.join(&test_path).exists() || exe_dir.join(&test_path).exists()
+            })
+            .unwrap_or(&model_dir_candidates[0]);
 
-        let model_file = default_model_dir.join("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf");
-        let mtp_file = default_model_dir.join("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf");
-        let vision_file = default_model_dir.join("mmproj-BF16.gguf");
+        let model_path = if chosen_model_dir.is_empty() {
+            r"Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf".to_string()
+        } else {
+            format!(r"{}\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf", chosen_model_dir)
+        };
+
+        let mtp_path = if chosen_model_dir.is_empty() {
+            r"mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf".to_string()
+        } else {
+            format!(r"{}\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf", chosen_model_dir)
+        };
+
+        let vision_path = if chosen_model_dir.is_empty() {
+            r"mmproj-BF16.gguf".to_string()
+        } else {
+            format!(r"{}\mmproj-BF16.gguf", chosen_model_dir)
+        };
 
         Self {
             gufo_path: default_gufo,
-            model_path: model_file.to_string_lossy().to_string(),
-            mtp_path: mtp_file.to_string_lossy().to_string(),
-            vision_path: vision_file.to_string_lossy().to_string(),
+            model_path,
+            mtp_path,
+            vision_path,
             served_model_name: "flash-next".to_string(),
             host: "127.0.0.1".to_string(),
             port: 12223, // 預設使用用戶指定的 12223 port
@@ -206,6 +229,33 @@ impl GufoManager {
         self.recent_logs.lock().await.iter().cloned().collect()
     }
 
+    pub fn resolve_path(path_str: &str) -> PathBuf {
+        let p = std::path::Path::new(path_str);
+        if p.is_absolute() && p.exists() {
+            return p.to_path_buf();
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            let candidate = cwd.join(p);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                let candidate = parent.join(p);
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            if p.is_relative() {
+                return cwd.join(p);
+            }
+        }
+        p.to_path_buf()
+    }
+
     pub async fn start(&self, app: AppHandle, new_config: Option<GufoServerConfig>) -> Result<ServerStatus, String> {
         // 先檢查伺服器是否已在運行中
         {
@@ -220,8 +270,11 @@ impl GufoManager {
         }
         let cfg = self.config.lock().await.clone();
 
+        let resolved_gufo = Self::resolve_path(&cfg.gufo_path);
+        let resolved_model = Self::resolve_path(&cfg.model_path);
+
         // 檢查執行檔是否存在
-        if !std::path::Path::new(&cfg.gufo_path).exists() {
+        if !resolved_gufo.exists() {
             let msg = format!("找不到 Gufo 主程式檔案：{}", cfg.gufo_path);
             *self.state.lock().await = ServerStateEnum::Error;
             *self.error_message.lock().await = Some(msg.clone());
@@ -229,7 +282,7 @@ impl GufoManager {
         }
 
         // 檢查模型檔案是否存在
-        if !std::path::Path::new(&cfg.model_path).exists() {
+        if !resolved_model.exists() {
             let msg = format!("找不到模型主檔：{}", cfg.model_path);
             *self.state.lock().await = ServerStateEnum::Error;
             *self.error_message.lock().await = Some(msg.clone());
@@ -253,7 +306,7 @@ impl GufoManager {
             cfg.max_request_bytes.to_string(),
             "llm".to_string(),
             "--model".to_string(),
-            cfg.model_path.clone(),
+            resolved_model.to_string_lossy().to_string(),
             "--served-model-name".to_string(),
             cfg.served_model_name.clone(),
             "--context".to_string(),
@@ -271,14 +324,17 @@ impl GufoManager {
             args.push(cfg.api_key.trim().to_string());
         }
 
-        if cfg.speculative == "mtp" && !cfg.mtp_path.is_empty() && std::path::Path::new(&cfg.mtp_path).exists() {
-            args.push("--speculative".to_string());
-            args.push("mtp".to_string());
-            args.push("--mtp-model".to_string());
-            args.push(cfg.mtp_path.clone());
-            if !cfg.mtp_policy.is_empty() {
-                args.push("--mtp-policy".to_string());
-                args.push(cfg.mtp_policy.clone());
+        if cfg.speculative == "mtp" && !cfg.mtp_path.is_empty() {
+            let resolved_mtp = Self::resolve_path(&cfg.mtp_path);
+            if resolved_mtp.exists() {
+                args.push("--speculative".to_string());
+                args.push("mtp".to_string());
+                args.push("--mtp-model".to_string());
+                args.push(resolved_mtp.to_string_lossy().to_string());
+                if !cfg.mtp_policy.is_empty() {
+                    args.push("--mtp-policy".to_string());
+                    args.push(cfg.mtp_policy.clone());
+                }
             }
         }
 
@@ -286,15 +342,21 @@ impl GufoManager {
             args.push("--prompt-lookup".to_string());
         }
 
-        if !cfg.vision_path.is_empty() && std::path::Path::new(&cfg.vision_path).exists() {
-            args.push("--mmproj".to_string());
-            args.push(cfg.vision_path.clone());
+        if !cfg.vision_path.is_empty() {
+            let resolved_vision = Self::resolve_path(&cfg.vision_path);
+            if resolved_vision.exists() {
+                args.push("--mmproj".to_string());
+                args.push(resolved_vision.to_string_lossy().to_string());
+            }
         }
 
-        let cmd_display = format!("{} {}", cfg.gufo_path, args.join(" "));
+        let cmd_display = format!("{} {}", resolved_gufo.display(), args.join(" "));
         self.add_log(format!("[系統] 準備啟動：{}", cmd_display)).await;
 
-        let mut command = Command::new(&cfg.gufo_path);
+        let mut command = Command::new(&resolved_gufo);
+        if let Ok(cwd) = std::env::current_dir() {
+            command.current_dir(cwd);
+        }
         command
             .args(&args)
             .stdout(Stdio::piped())
@@ -508,6 +570,10 @@ mod tests {
         assert_eq!(config.mtp_policy, "survival");
         assert!(config.prompt_lookup);
         assert_eq!(config.api_key, "");
+
+        // 預設路徑應為相對工作目錄，不應寫死 D:\Agents 或 D:\Models
+        assert!(!config.gufo_path.starts_with(r"D:\Agents\gufo"));
+        assert!(!config.model_path.starts_with(r"D:\Models\GGUF"));
     }
 
     #[tokio::test]
@@ -529,6 +595,12 @@ mod tests {
         // 測試 stop 不會因為 Mutex 造成死鎖
         let stop_status = manager.stop().await.unwrap();
         assert_eq!(stop_status.state, ServerStateEnum::Stopped);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_relative_path() {
+        let p = GufoManager::resolve_path("Cargo.toml");
+        assert!(p.is_relative() || p.is_absolute());
     }
 }
 

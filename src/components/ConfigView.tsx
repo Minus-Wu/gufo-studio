@@ -112,6 +112,7 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
               type="text"
               className="form-input"
               value={form.gufo_path}
+              placeholder="工作目錄相對路徑或絕對路徑，例如: build\release\gufo.exe 或 gufo.exe"
               disabled={isRunning}
               onChange={(e) => handleChange('gufo_path', e.target.value)}
             />
@@ -135,6 +136,7 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
               type="text"
               className="form-input"
               value={form.model_path}
+              placeholder="工作目錄相對路徑或絕對路徑，例如: models\Qwen3.8-Flash-Next-GGUF\..."
               disabled={isRunning}
               onChange={(e) => handleChange('model_path', e.target.value)}
             />
@@ -158,6 +160,7 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
               type="text"
               className="form-input"
               value={form.mtp_path}
+              placeholder="工作目錄相對路徑或絕對路徑，例如: models\Qwen3.8-Flash-Next-GGUF\mtp-*.gguf"
               disabled={isRunning}
               onChange={(e) => handleChange('mtp_path', e.target.value)}
             />
@@ -181,6 +184,7 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
               type="text"
               className="form-input"
               value={form.vision_path}
+              placeholder="工作目錄相對路徑或絕對路徑，例如: models\Qwen3.8-Flash-Next-GGUF\mmproj-BF16.gguf"
               disabled={isRunning}
               onChange={(e) => handleChange('vision_path', e.target.value)}
             />

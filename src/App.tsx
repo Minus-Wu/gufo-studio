@@ -25,12 +25,12 @@ export function App() {
   });
 
   const [config, setConfig] = useState<GufoServerConfig>({
-    gufo_path: 'D:\\Agents\\gufo\\build\\release\\gufo.exe',
+    gufo_path: 'build\\release\\gufo.exe',
     model_path:
-      'D:\\Models\\GGUF\\Qwen3.8-Flash-Next-GGUF\\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf',
+      'models\\Qwen3.8-Flash-Next-GGUF\\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf',
     mtp_path:
-      'D:\\Models\\GGUF\\Qwen3.8-Flash-Next-GGUF\\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf',
-    vision_path: 'D:\\Models\\GGUF\\Qwen3.8-Flash-Next-GGUF\\mmproj-BF16.gguf',
+      'models\\Qwen3.8-Flash-Next-GGUF\\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf',
+    vision_path: 'models\\Qwen3.8-Flash-Next-GGUF\\mmproj-BF16.gguf',
     served_model_name: 'flash-next',
     host: '127.0.0.1',
     port: 12223,
@@ -53,7 +53,28 @@ export function App() {
     const init = async () => {
       try {
         const defaultCfg = await invoke<GufoServerConfig>('get_default_config');
-        setConfig(defaultCfg);
+
+        // 若 localStorage 存有設定且不是舊版寫死的 D:\Agents 絕對路徑，才使用 localStorage
+        const saved = localStorage.getItem('gufo_studio_config');
+        if (saved) {
+          try {
+            const parsed = JSON.parse(saved);
+            if (
+              parsed.gufo_path &&
+              !parsed.gufo_path.includes('D:\\Agents\\gufo') &&
+              !parsed.gufo_path.includes('D:/Agents/gufo')
+            ) {
+              setConfig(parsed);
+            } else {
+              setConfig(defaultCfg);
+              localStorage.setItem('gufo_studio_config', JSON.stringify(defaultCfg));
+            }
+          } catch {
+            setConfig(defaultCfg);
+          }
+        } else {
+          setConfig(defaultCfg);
+        }
 
         const currentStatus = await invoke<ServerStatus>('get_server_status');
         setStatus(currentStatus);
