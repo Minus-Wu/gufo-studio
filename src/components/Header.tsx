@@ -86,7 +86,7 @@ export const Header: React.FC<HeaderProps> = ({
             {status.state === 'running'
               ? `Port ${status.port} (${formatUptime(status.uptime_secs)})`
               : status.state === 'starting'
-              ? '啟動中...'
+              ? '模型載入中...'
               : status.state === 'error'
               ? '發生錯誤'
               : '已停止'}
