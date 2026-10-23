@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Gufo Studio",
         "width": 1200,
         "height": 840,

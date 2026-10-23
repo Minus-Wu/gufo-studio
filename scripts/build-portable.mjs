@@ -9,18 +9,17 @@ const rootDir = path.resolve(__dirname, '..');
 
 console.log('🚀 開始建置 Gufo Studio 單一執行檔 (Portable / Standalone Single Executable)...');
 
-// 1. 建置前端
-console.log('\n📦 [1/3] 建置前端靜態資源...');
-execSync('pnpm build', { cwd: rootDir, stdio: 'inherit' });
-
-// 2. 建置 Rust Release 二進制檔案
-console.log('\n🦀 [2/3] 編譯 Rust 後端單一執行檔 (Release with LTO & Strip)...');
-execSync('cargo build --release --manifest-path src-tauri/Cargo.toml', {
+// 1. 使用 Tauri CLI 的 --no-bundle 模式進行正式發布建置
+// 這會自動建置前端靜態資產，並將其全部內嵌至獨立的二進制檔案中（絕不連線 localhost 開發伺服器）
+console.log('\n📦 [1/2] 執行 Tauri 生產環境建置 (靜態嵌入前端與編譯 Release 二進制檔案)...');
+execSync('pnpm tauri build --no-bundle', {
   cwd: rootDir,
   stdio: 'inherit',
+  shell: true,
 });
 
-// 3. 輸出至 dist-portable 資料夾
+// 2. 複製產出到 dist-portable 資料夾
+console.log('\n📂 [2/2] 整理單一執行檔輸出目錄...');
 const outputDir = path.join(rootDir, 'dist-portable');
 if (!fs.existsSync(outputDir)) {
   fs.mkdirSync(outputDir, { recursive: true });
@@ -57,6 +56,6 @@ const readmeContent = `🦉 Gufo Studio - 單一執行檔便攜版 (Standalone P
 
 fs.writeFileSync(path.join(outputDir, 'README-PORTABLE.txt'), readmeContent, 'utf-8');
 
-console.log('\n🎉 [3/3] 打包完成！');
+console.log('\n🎉 打包完成！');
 console.log(`📁 單一執行檔輸出路徑: ${targetExe} (${sizeMB} MB)`);
 console.log(`📄 說明文件: ${path.join(outputDir, 'README-PORTABLE.txt')}\n`);
