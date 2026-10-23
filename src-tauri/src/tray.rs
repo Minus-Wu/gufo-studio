@@ -59,6 +59,9 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 "quit" => {
                     let app_clone = app.clone();
                     tokio::spawn(async move {
+                        if let Some(window) = app_clone.get_webview_window("main") {
+                            crate::window_state::save_window_state(&window);
+                        }
                         let state = app_clone.state::<crate::AppState>();
                         let _ = state.manager.stop().await;
                         app_clone.exit(0);

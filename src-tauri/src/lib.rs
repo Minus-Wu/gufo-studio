@@ -1,6 +1,7 @@
 mod commands;
 pub mod gufo_manager;
 mod tray;
+pub mod window_state;
 
 use gufo_manager::GufoManager;
 use std::sync::Arc;
@@ -26,11 +27,23 @@ pub fn run() {
 
             // 監聽視窗關閉事件：關閉時隱藏視窗至 Tray，而非直接退出
             if let Some(window) = app.get_webview_window("main") {
+                // 啟動時還原上次關閉時的位置與尺寸，若超出螢幕則移動至第一個螢幕
+                window_state::restore_window_state(&window);
+
                 let win_clone = window.clone();
                 window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = win_clone.hide();
+                    match event {
+                        WindowEvent::CloseRequested { api, .. } => {
+                            api.prevent_close();
+                            // 隱藏至 Tray 前記錄當前視窗狀態
+                            window_state::save_window_state(&win_clone);
+                            let _ = win_clone.hide();
+                        }
+                        WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
+                            // 移動或縮放時持續記錄
+                            window_state::save_window_state(&win_clone);
+                        }
+                        _ => {}
                     }
                 });
             }
@@ -50,8 +63,12 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(move |_app_handle, event| {
+        .run(move |app_handle, event| {
             if let tauri::RunEvent::Exit = event {
+                // 退出前確保儲存最新視窗狀態
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    window_state::save_window_state(&window);
+                }
                 // 當 App 徹底退出時，確保終止 gufo.exe 子程序，避免 GPU 顯存殘留
                 let manager = manager_for_exit.clone();
                 tauri::async_runtime::block_on(async move {
