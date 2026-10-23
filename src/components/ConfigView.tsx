@@ -11,6 +11,7 @@ import {
   Eye,
   EyeOff,
   Sparkles,
+  FolderOpen,
 } from 'lucide-react';
 import { GufoServerConfig } from '../types';
 
@@ -37,6 +38,27 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
     handleChange('api_key', `sk-gufo-${randomHex}`);
+  };
+
+  const handleBrowse = async (
+    field: keyof GufoServerConfig,
+    title: string,
+    filterName: string,
+    extensions: string[]
+  ) => {
+    try {
+      const selected = await invoke<string | null>('select_file', {
+        title,
+        filterName,
+        extensions,
+        defaultPath: (form[field] as string) || undefined,
+      });
+      if (selected) {
+        handleChange(field, selected);
+      }
+    } catch (err) {
+      console.error('選擇檔案失敗:', err);
+    }
   };
 
   useEffect(() => {
@@ -108,14 +130,34 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                 </span>
               )}
             </div>
-            <input
-              type="text"
-              className="form-input"
-              value={form.gufo_path}
-              placeholder="工作目錄相對路徑或絕對路徑，例如: build\release\gufo.exe 或 gufo.exe"
-              disabled={isRunning}
-              onChange={(e) => handleChange('gufo_path', e.target.value)}
-            />
+            <div className="path-input-group">
+              <input
+                type="text"
+                className="form-input"
+                value={form.gufo_path}
+                placeholder="工作目錄相對路徑或絕對路徑，例如: build\release\gufo.exe 或 gufo.exe"
+                disabled={isRunning}
+                onChange={(e) => handleChange('gufo_path', e.target.value)}
+              />
+              <button
+                type="button"
+                className="btn btn-secondary"
+                style={{ flexShrink: 0, padding: '7px 12px' }}
+                disabled={isRunning}
+                onClick={() =>
+                  handleBrowse(
+                    'gufo_path',
+                    '選擇 Gufo 執行檔 (gufo.exe)',
+                    'Gufo 執行檔 (*.exe)',
+                    ['exe']
+                  )
+                }
+                title="瀏覽選擇執行檔"
+              >
+                <FolderOpen size={14} />
+                <span>瀏覽...</span>
+              </button>
+            </div>
           </div>
 
           {/* 模型主檔路徑 */}
@@ -132,14 +174,34 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                 </span>
               )}
             </div>
-            <input
-              type="text"
-              className="form-input"
-              value={form.model_path}
-              placeholder="工作目錄相對路徑或絕對路徑，例如: models\Qwen3.8-Flash-Next-GGUF\..."
-              disabled={isRunning}
-              onChange={(e) => handleChange('model_path', e.target.value)}
-            />
+            <div className="path-input-group">
+              <input
+                type="text"
+                className="form-input"
+                value={form.model_path}
+                placeholder="工作目錄相對路徑或絕對路徑，例如: models\Qwen3.8-Flash-Next-GGUF\..."
+                disabled={isRunning}
+                onChange={(e) => handleChange('model_path', e.target.value)}
+              />
+              <button
+                type="button"
+                className="btn btn-secondary"
+                style={{ flexShrink: 0, padding: '7px 12px' }}
+                disabled={isRunning}
+                onClick={() =>
+                  handleBrowse(
+                    'model_path',
+                    '選擇 Qwen3.8-Flash-Next 主模型 (GGUF)',
+                    'GGUF 模型檔 (*.gguf)',
+                    ['gguf']
+                  )
+                }
+                title="瀏覽選擇主模型 GGUF 檔案"
+              >
+                <FolderOpen size={14} />
+                <span>瀏覽...</span>
+              </button>
+            </div>
           </div>
 
           {/* MTP 投機解碼模型 */}
@@ -156,14 +218,34 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                 </span>
               )}
             </div>
-            <input
-              type="text"
-              className="form-input"
-              value={form.mtp_path}
-              placeholder="工作目錄相對路徑或絕對路徑，例如: models\Qwen3.8-Flash-Next-GGUF\mtp-*.gguf"
-              disabled={isRunning}
-              onChange={(e) => handleChange('mtp_path', e.target.value)}
-            />
+            <div className="path-input-group">
+              <input
+                type="text"
+                className="form-input"
+                value={form.mtp_path}
+                placeholder="工作目錄相對路徑或絕對路徑，例如: models\Qwen3.8-Flash-Next-GGUF\mtp-*.gguf"
+                disabled={isRunning}
+                onChange={(e) => handleChange('mtp_path', e.target.value)}
+              />
+              <button
+                type="button"
+                className="btn btn-secondary"
+                style={{ flexShrink: 0, padding: '7px 12px' }}
+                disabled={isRunning}
+                onClick={() =>
+                  handleBrowse(
+                    'mtp_path',
+                    '選擇 MTP 投機解碼加速模型 (GGUF)',
+                    'GGUF 模型檔 (*.gguf)',
+                    ['gguf']
+                  )
+                }
+                title="瀏覽選擇 MTP 模型 GGUF 檔案"
+              >
+                <FolderOpen size={14} />
+                <span>瀏覽...</span>
+              </button>
+            </div>
           </div>
 
           {/* Vision 視覺側車模型 */}
@@ -180,14 +262,34 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                 </span>
               )}
             </div>
-            <input
-              type="text"
-              className="form-input"
-              value={form.vision_path}
-              placeholder="工作目錄相對路徑或絕對路徑，例如: models\Qwen3.8-Flash-Next-GGUF\mmproj-BF16.gguf"
-              disabled={isRunning}
-              onChange={(e) => handleChange('vision_path', e.target.value)}
-            />
+            <div className="path-input-group">
+              <input
+                type="text"
+                className="form-input"
+                value={form.vision_path}
+                placeholder="工作目錄相對路徑或絕對路徑，例如: models\Qwen3.8-Flash-Next-GGUF\mmproj-BF16.gguf"
+                disabled={isRunning}
+                onChange={(e) => handleChange('vision_path', e.target.value)}
+              />
+              <button
+                type="button"
+                className="btn btn-secondary"
+                style={{ flexShrink: 0, padding: '7px 12px' }}
+                disabled={isRunning}
+                onClick={() =>
+                  handleBrowse(
+                    'vision_path',
+                    '選擇多模態視覺模型 (mmproj *.gguf)',
+                    'GGUF 模型檔 (*.gguf)',
+                    ['gguf']
+                  )
+                }
+                title="瀏覽選擇視覺模型 GGUF 檔案"
+              >
+                <FolderOpen size={14} />
+                <span>瀏覽...</span>
+              </button>
+            </div>
           </div>
         </div>
       </div>

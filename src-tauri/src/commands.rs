@@ -66,3 +66,55 @@ pub fn check_path_exists(path: String) -> bool {
     }
     false
 }
+
+#[tauri::command]
+pub async fn select_file(
+    title: Option<String>,
+    filter_name: Option<String>,
+    extensions: Option<Vec<String>>,
+    default_path: Option<String>,
+) -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(t) = title {
+            dialog = dialog.set_title(&t);
+        }
+        if let (Some(name), Some(exts)) = (filter_name, extensions) {
+            let str_slices: Vec<&str> = exts.iter().map(|s| s.as_str()).collect();
+            dialog = dialog.add_filter(&name, &str_slices);
+        }
+        if let Some(def) = default_path {
+            let p = std::path::Path::new(&def);
+            if p.exists() {
+                if p.is_dir() {
+                    dialog = dialog.set_directory(p);
+                } else if let Some(parent) = p.parent() {
+                    dialog = dialog.set_directory(parent);
+                }
+            } else if let Ok(cwd) = std::env::current_dir() {
+                let full = cwd.join(p);
+                if let Some(parent) = full.parent() {
+                    if parent.exists() {
+                        dialog = dialog.set_directory(parent);
+                    }
+                }
+            }
+        } else if let Ok(cwd) = std::env::current_dir() {
+            dialog = dialog.set_directory(&cwd);
+        }
+
+        let picked = dialog.pick_file();
+        if let Some(path_buf) = picked {
+            // 若選取檔案位於工作目錄下，優先轉為簡潔的相對路徑
+            if let Ok(cwd) = std::env::current_dir() {
+                if let Ok(rel) = path_buf.strip_prefix(&cwd) {
+                    return Ok(Some(rel.to_string_lossy().to_string()));
+                }
+            }
+            return Ok(Some(path_buf.to_string_lossy().to_string()));
+        }
+        Ok(None)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}

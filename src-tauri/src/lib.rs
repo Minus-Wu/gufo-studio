@@ -46,6 +46,7 @@ pub fn run() {
             commands::check_health,
             commands::get_recent_logs,
             commands::check_path_exists,
+            commands::select_file,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
