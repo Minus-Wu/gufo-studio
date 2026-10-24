@@ -22,10 +22,10 @@ pub fn run() {
             manager: manager.clone(),
         })
         .setup(|app| {
-            // 初始化系統匣 (Tray Icon)
-            tray::setup_tray(app.handle())?;
-
             let initial_config = gufo_manager::GufoManager::load_saved_config().unwrap_or_default();
+
+            // 初始化系統匣 (Tray Icon)
+            tray::setup_tray(app.handle(), initial_config.port)?;
 
             // 監聽視窗關閉事件：關閉時隱藏視窗至 Tray，而非直接退出
             if let Some(window) = app.get_webview_window("main") {
@@ -55,17 +55,20 @@ pub fn run() {
                 });
             }
 
-            // 檢查是否啟動後自動啟動推論伺服器
-            if initial_config.auto_start_server {
-                let app_handle = app.handle().clone();
-                let state = app.state::<AppState>();
-                let manager_clone = state.manager.clone();
-                tauri::async_runtime::spawn(async move {
-                    // 稍微延遲 500ms 確保系統匣、前端與事件通道就緒
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // 檢查是否啟動後自動啟動推論伺服器，否則主動探測背景是否已有運行中的 Gufo 伺服器以同步狀態
+            let app_handle = app.handle().clone();
+            let state = app.state::<AppState>();
+            let manager_clone = state.manager.clone();
+            let auto_start = initial_config.auto_start_server;
+            tauri::async_runtime::spawn(async move {
+                // 稍微延遲 500ms 確保系統匣、前端與事件通道就緒
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if auto_start {
                     let _ = manager_clone.start(app_handle, None).await;
-                });
-            }
+                } else {
+                    manager_clone.sync_existing_server_on_startup(app_handle).await;
+                }
+            });
 
             Ok(())
         })
@@ -92,7 +95,7 @@ pub fn run() {
                 // 當 App 徹底退出時，確保終止 gufo.exe 子程序，避免 GPU 顯存殘留
                 let manager = manager_for_exit.clone();
                 tauri::async_runtime::block_on(async move {
-                    let _ = manager.stop().await;
+                    let _ = manager.stop(None).await;
                 });
             }
         });

@@ -229,6 +229,7 @@ impl InferenceMetrics {
 
 pub struct GufoManager {
     child: Arc<Mutex<Option<Child>>>,
+    is_adopted: Arc<Mutex<bool>>,
     config: Arc<Mutex<GufoServerConfig>>,
     state: Arc<Mutex<ServerStateEnum>>,
     start_time: Arc<Mutex<Option<Instant>>>,
@@ -242,6 +243,7 @@ impl GufoManager {
         let initial_config = Self::load_saved_config().unwrap_or_default();
         Self {
             child: Arc::new(Mutex::new(None)),
+            is_adopted: Arc::new(Mutex::new(false)),
             config: Arc::new(Mutex::new(initial_config)),
             state: Arc::new(Mutex::new(ServerStateEnum::Stopped)),
             start_time: Arc::new(Mutex::new(None)),
@@ -271,8 +273,16 @@ impl GufoManager {
         None
     }
 
-    pub async fn save_config(&self, cfg: GufoServerConfig) -> Result<(), String> {
+    pub async fn save_config(
+        &self,
+        app: Option<&AppHandle>,
+        cfg: GufoServerConfig,
+    ) -> Result<(), String> {
         *self.config.lock().await = cfg.clone();
+        if let Some(app_handle) = app {
+            let current_state = self.state.lock().await.clone();
+            crate::tray::update_tray_status(app_handle, &current_state, cfg.port);
+        }
         let path = Self::get_config_file_path();
         let json = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
         std::fs::write(&path, json).map_err(|e| format!("無法寫入設定檔 {}: {}", path.display(), e))?;
@@ -283,19 +293,86 @@ impl GufoManager {
         self.config.lock().await.clone()
     }
 
-    pub async fn get_status(&self) -> ServerStatus {
-        let state = self.state.lock().await.clone();
+    pub async fn get_status(&self, app: Option<&AppHandle>) -> ServerStatus {
         let cfg = self.config.lock().await.clone();
+
+        // 主動檢查子進程是否已經意外終止
+        let mut unexpected_exit: Option<String> = None;
+        {
+            let mut child_guard = self.child.lock().await;
+            if let Some(ref mut child) = *child_guard {
+                if let Ok(Some(exit_status)) = child.try_wait() {
+                    *child_guard = None;
+                    unexpected_exit = Some(exit_status.to_string());
+                }
+            }
+        }
+
+        if let Some(exit_str) = unexpected_exit {
+            let mut st = self.state.lock().await;
+            if *st != ServerStateEnum::Stopped {
+                *st = ServerStateEnum::Stopped;
+                drop(st);
+                *self.start_time.lock().await = None;
+                *self.is_adopted.lock().await = false;
+                let log_msg = format!(
+                    "[系統] ⚠️ 偵測到 Gufo 推理伺服器已意外中止 ({})，狀態已自動重置為已停止。",
+                    exit_str
+                );
+                self.add_log(log_msg.clone()).await;
+                if let Some(app_handle) = app {
+                    let _ = app_handle.emit("gufo-log", log_msg);
+                    crate::tray::update_tray_status(app_handle, &ServerStateEnum::Stopped, cfg.port);
+                    let _ = app_handle.emit("gufo-status-changed", "stopped");
+                }
+            }
+        } else {
+            let is_adopted = *self.is_adopted.lock().await;
+            let current_state = self.state.lock().await.clone();
+            if is_adopted && current_state == ServerStateEnum::Running {
+                let port_alive = tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    tokio::net::TcpStream::connect((cfg.host.as_str(), cfg.port)),
+                )
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false);
+
+                if !port_alive {
+                    *self.is_adopted.lock().await = false;
+                    *self.state.lock().await = ServerStateEnum::Stopped;
+                    *self.start_time.lock().await = None;
+                    let log_msg =
+                        "[系統] ⚠️ 偵測到外部 Gufo 推理伺服器已中止，狀態已自動重置為已停止。"
+                            .to_string();
+                    self.add_log(log_msg.clone()).await;
+                    if let Some(app_handle) = app {
+                        let _ = app_handle.emit("gufo-log", log_msg);
+                        crate::tray::update_tray_status(
+                            app_handle,
+                            &ServerStateEnum::Stopped,
+                            cfg.port,
+                        );
+                        let _ = app_handle.emit("gufo-status-changed", "stopped");
+                    }
+                }
+            }
+        }
+
+        let state = self.state.lock().await.clone();
         let pid = {
             let child_guard = self.child.lock().await;
             child_guard.as_ref().and_then(|c| c.id())
         };
-        let uptime = self
-            .start_time
-            .lock()
-            .await
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0);
+        let uptime = if state == ServerStateEnum::Running {
+            self.start_time
+                .lock()
+                .await
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let err = self.error_message.lock().await.clone();
 
         ServerStatus {
@@ -350,12 +427,256 @@ impl GufoManager {
         p.to_path_buf()
     }
 
+    pub async fn sync_existing_server_on_startup(&self, app: AppHandle) {
+        if self.check_health().await {
+            let cfg = self.config.lock().await.clone();
+            let mut st = self.state.lock().await;
+            if *st == ServerStateEnum::Stopped {
+                *st = ServerStateEnum::Running;
+                drop(st);
+                *self.is_adopted.lock().await = true;
+                *self.start_time.lock().await = Some(Instant::now());
+                *self.error_message.lock().await = None;
+
+                let log_msg = format!(
+                    "[系統] 偵測到 Port {} 已有運行的 Gufo 伺服器，已自動同步運行狀態。",
+                    cfg.port
+                );
+                self.add_log(log_msg.clone()).await;
+                let _ = app.emit("gufo-log", log_msg);
+                crate::tray::update_tray_status(&app, &ServerStateEnum::Running, cfg.port);
+                let _ = app.emit("gufo-status-changed", "running");
+
+                self.spawn_lifecycle_monitor(
+                    app,
+                    cfg.host.clone(),
+                    cfg.port,
+                    cfg.api_key.trim().to_string(),
+                );
+            }
+        }
+    }
+
+    fn spawn_lifecycle_monitor(
+        &self,
+        app: AppHandle,
+        host: String,
+        port: u16,
+        api_key: String,
+    ) {
+        let state_clone = self.state.clone();
+        let child_clone = self.child.clone();
+        let is_adopted_clone = self.is_adopted.clone();
+        let start_time_clone = self.start_time.clone();
+        let error_msg_clone = self.error_message.clone();
+        let logs_clone = self.recent_logs.clone();
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(800))
+            .build()
+            .unwrap_or_default();
+        let health_url = format!("http://{}:{}/health", host, port);
+
+        tokio::spawn(async move {
+            // 第一階段：若處於 Starting，每 500ms 探測一次健康狀態，最多嘗試 240 次 (約 2 分鐘)
+            for _ in 0..240 {
+                {
+                    let st = state_clone.lock().await;
+                    if *st == ServerStateEnum::Running {
+                        break;
+                    }
+                    if *st == ServerStateEnum::Stopped || *st == ServerStateEnum::Error {
+                        return;
+                    }
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                {
+                    let st = state_clone.lock().await;
+                    if *st == ServerStateEnum::Running {
+                        break;
+                    }
+                    if *st == ServerStateEnum::Stopped || *st == ServerStateEnum::Error {
+                        return;
+                    }
+                }
+
+                // 檢查進程是否在啟動期間意外退出
+                {
+                    let mut child_guard = child_clone.lock().await;
+                    if let Some(ref mut child) = *child_guard {
+                        if let Ok(Some(exit_status)) = child.try_wait() {
+                            *child_guard = None;
+                            drop(child_guard);
+                            *start_time_clone.lock().await = None;
+                            let err_msg = format!("Gufo 推理伺服器在啟動階段意外中止 ({})", exit_status);
+                            *error_msg_clone.lock().await = Some(err_msg.clone());
+                            *state_clone.lock().await = ServerStateEnum::Error;
+                            let log_line = format!("[錯誤] {}", err_msg);
+                            {
+                                let mut logs = logs_clone.lock().await;
+                                if logs.len() >= 1000 {
+                                    logs.pop_front();
+                                }
+                                logs.push_back(log_line.clone());
+                            }
+                            let _ = app.emit("gufo-log", log_line);
+                            crate::tray::update_tray_status(&app, &ServerStateEnum::Error, port);
+                            let _ = app.emit("gufo-status-changed", "error");
+                            return;
+                        }
+                    } else if !*is_adopted_clone.lock().await {
+                        return;
+                    }
+                }
+
+                // HTTP GET /health 探測
+                let mut req = client.get(&health_url);
+                if !api_key.is_empty() {
+                    req = req.bearer_auth(&api_key);
+                }
+
+                if let Ok(resp) = req.send().await {
+                    if resp.status().is_success() {
+                        let mut st = state_clone.lock().await;
+                        if *st == ServerStateEnum::Starting {
+                            *st = ServerStateEnum::Running;
+                            drop(st);
+                            crate::tray::update_tray_status(&app, &ServerStateEnum::Running, port);
+                            let _ = app.emit("gufo-status-changed", "running");
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // 若超過嘗試時間仍處於 Starting，檢查進程是否仍在運行
+            {
+                let mut st = state_clone.lock().await;
+                if *st == ServerStateEnum::Starting {
+                    let mut child_guard = child_clone.lock().await;
+                    if let Some(ref mut child) = *child_guard {
+                        if let Ok(None) = child.try_wait() {
+                            *st = ServerStateEnum::Running;
+                            drop(child_guard);
+                            drop(st);
+                            crate::tray::update_tray_status(&app, &ServerStateEnum::Running, port);
+                            let _ = app.emit("gufo-status-changed", "running");
+                        } else {
+                            *child_guard = None;
+                            drop(child_guard);
+                            *st = ServerStateEnum::Error;
+                            drop(st);
+                            *start_time_clone.lock().await = None;
+                            crate::tray::update_tray_status(&app, &ServerStateEnum::Error, port);
+                            let _ = app.emit("gufo-status-changed", "error");
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
+                }
+            }
+
+            // 第二階段：持續監控運行中的伺服器，偵測意外崩潰或被外部終止
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+                {
+                    let st = state_clone.lock().await;
+                    if *st != ServerStateEnum::Running {
+                        return;
+                    }
+                }
+
+                let mut child_guard = child_clone.lock().await;
+                if let Some(ref mut child) = *child_guard {
+                    if let Ok(Some(exit_status)) = child.try_wait() {
+                        *child_guard = None;
+                        drop(child_guard);
+
+                        let mut st = state_clone.lock().await;
+                        if *st != ServerStateEnum::Stopped {
+                            *st = ServerStateEnum::Stopped;
+                            drop(st);
+                            *start_time_clone.lock().await = None;
+                            *is_adopted_clone.lock().await = false;
+
+                            let log_msg = format!(
+                                "[系統] ⚠️ 偵測到 Gufo 推理伺服器已意外中止 ({})，狀態已自動重置為已停止。",
+                                exit_status
+                            );
+                            {
+                                let mut logs = logs_clone.lock().await;
+                                if logs.len() >= 1000 {
+                                    logs.pop_front();
+                                }
+                                logs.push_back(log_msg.clone());
+                            }
+                            let _ = app.emit("gufo-log", log_msg);
+                            crate::tray::update_tray_status(&app, &ServerStateEnum::Stopped, port);
+                            let _ = app.emit("gufo-status-changed", "stopped");
+                        }
+                        return;
+                    }
+                } else {
+                    drop(child_guard);
+                    if *is_adopted_clone.lock().await {
+                        let port_alive = tokio::time::timeout(
+                            std::time::Duration::from_millis(500),
+                            tokio::net::TcpStream::connect((host.as_str(), port)),
+                        )
+                        .await
+                        .map(|r| r.is_ok())
+                        .unwrap_or(false);
+
+                        if !port_alive {
+                            *is_adopted_clone.lock().await = false;
+                            let mut st = state_clone.lock().await;
+                            if *st != ServerStateEnum::Stopped {
+                                *st = ServerStateEnum::Stopped;
+                                drop(st);
+                                *start_time_clone.lock().await = None;
+
+                                let log_msg =
+                                    "[系統] ⚠️ 偵測到外部 Gufo 推理伺服器已中止，狀態已自動重置為已停止。"
+                                        .to_string();
+                                {
+                                    let mut logs = logs_clone.lock().await;
+                                    if logs.len() >= 1000 {
+                                        logs.pop_front();
+                                    }
+                                    logs.push_back(log_msg.clone());
+                                }
+                                let _ = app.emit("gufo-log", log_msg);
+                                crate::tray::update_tray_status(
+                                    &app,
+                                    &ServerStateEnum::Stopped,
+                                    port,
+                                );
+                                let _ = app.emit("gufo-status-changed", "stopped");
+                            }
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
     pub async fn start(&self, app: AppHandle, new_config: Option<GufoServerConfig>) -> Result<ServerStatus, String> {
-        // 先檢查伺服器是否已在運行中
+        // 先檢查伺服器是否已在運行中（若子進程已意外退出則先清理）
         {
-            let child_guard = self.child.lock().await;
-            if child_guard.is_some() {
-                return Err("伺服器已在運行中".to_string());
+            let mut child_guard = self.child.lock().await;
+            if let Some(ref mut child) = *child_guard {
+                if let Ok(Some(_)) = child.try_wait() {
+                    *child_guard = None;
+                } else {
+                    return Err("伺服器已在運行中".to_string());
+                }
             }
         }
 
@@ -383,10 +704,19 @@ impl GufoManager {
                 ))
                 .await;
                 *self.state.lock().await = ServerStateEnum::Running;
+                *self.is_adopted.lock().await = true;
                 *self.start_time.lock().await = Some(Instant::now());
                 *self.error_message.lock().await = None;
+                crate::tray::update_tray_status(&app, &ServerStateEnum::Running, cfg.port);
                 let _ = app.emit("gufo-status-changed", "running");
-                return Ok(self.get_status().await);
+
+                self.spawn_lifecycle_monitor(
+                    app.clone(),
+                    cfg.host.clone(),
+                    cfg.port,
+                    cfg.api_key.trim().to_string(),
+                );
+                return Ok(self.get_status(Some(&app)).await);
             }
         }
 
@@ -399,6 +729,7 @@ impl GufoManager {
             self.add_log(format!("[錯誤] {}", err_msg)).await;
             *self.state.lock().await = ServerStateEnum::Error;
             *self.error_message.lock().await = Some(err_msg.clone());
+            crate::tray::update_tray_status(&app, &ServerStateEnum::Error, cfg.port);
             let _ = app.emit("gufo-status-changed", "error");
             return Err(err_msg);
         }
@@ -411,6 +742,8 @@ impl GufoManager {
             let msg = format!("找不到 Gufo 主程式檔案：{}", cfg.gufo_path);
             *self.state.lock().await = ServerStateEnum::Error;
             *self.error_message.lock().await = Some(msg.clone());
+            crate::tray::update_tray_status(&app, &ServerStateEnum::Error, cfg.port);
+            let _ = app.emit("gufo-status-changed", "error");
             return Err(msg);
         }
 
@@ -419,12 +752,17 @@ impl GufoManager {
             let msg = format!("找不到模型主檔：{}", cfg.model_path);
             *self.state.lock().await = ServerStateEnum::Error;
             *self.error_message.lock().await = Some(msg.clone());
+            crate::tray::update_tray_status(&app, &ServerStateEnum::Error, cfg.port);
+            let _ = app.emit("gufo-status-changed", "error");
             return Err(msg);
         }
 
         *self.state.lock().await = ServerStateEnum::Starting;
+        *self.is_adopted.lock().await = false;
         *self.error_message.lock().await = None;
         *self.start_time.lock().await = None;
+        crate::tray::update_tray_status(&app, &ServerStateEnum::Starting, cfg.port);
+        let _ = app.emit("gufo-status-changed", "starting");
 
         // 組裝指令參數
         let mut args: Vec<String> = vec![
@@ -508,6 +846,8 @@ impl GufoManager {
                 let err = format!("無法啟動 Gufo 程序: {}", e);
                 *self.state.lock().await = ServerStateEnum::Error;
                 *self.error_message.lock().await = Some(err.clone());
+                crate::tray::update_tray_status(&app, &ServerStateEnum::Error, cfg.port);
+                let _ = app.emit("gufo-status-changed", "error");
                 return Err(err);
             }
         };
@@ -521,6 +861,8 @@ impl GufoManager {
             *child_guard = Some(spawned);
         }
         *self.start_time.lock().await = Some(Instant::now());
+
+        let port = cfg.port;
 
         // 啟動 stdout 讀取任務
         let logs_clone1 = self.recent_logs.clone();
@@ -556,6 +898,12 @@ impl GufoManager {
                         let mut st = state_clone1.lock().await;
                         if *st == ServerStateEnum::Starting {
                             *st = ServerStateEnum::Running;
+                            drop(st);
+                            crate::tray::update_tray_status(
+                                &app_clone1,
+                                &ServerStateEnum::Running,
+                                port,
+                            );
                             let _ = app_clone1.emit("gufo-status-changed", "running");
                         }
                     }
@@ -597,6 +945,12 @@ impl GufoManager {
                         let mut st = state_clone2.lock().await;
                         if *st == ServerStateEnum::Starting {
                             *st = ServerStateEnum::Running;
+                            drop(st);
+                            crate::tray::update_tray_status(
+                                &app_clone2,
+                                &ServerStateEnum::Running,
+                                port,
+                            );
                             let _ = app_clone2.emit("gufo-status-changed", "running");
                         }
                     }
@@ -604,88 +958,23 @@ impl GufoManager {
             });
         }
 
-        // 啟動健康檢查背景監控 (以標準 HTTP GET /health 探測，避免發送空 TCP 封包引發 400 bad_request)
-        let state_clone = self.state.clone();
-        let child_clone = self.child.clone();
-        let host = cfg.host.clone();
-        let port = cfg.port;
-        let api_key = cfg.api_key.trim().to_string();
-        let app_clone3 = app.clone();
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(800))
-            .build()
-            .unwrap_or_default();
-        let health_url = format!("http://{}:{}/health", host, port);
+        // 啟動全生命週期監控（包含啟動健康檢查與運行期間意外中止偵測）
+        self.spawn_lifecycle_monitor(
+            app.clone(),
+            cfg.host.clone(),
+            cfg.port,
+            cfg.api_key.trim().to_string(),
+        );
 
-        tokio::spawn(async move {
-            // 每 500ms 檢查一次，最多嘗試 240 次 (約 2 分鐘，適合大模型載入)
-            for _ in 0..240 {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-                // 若已被日誌讀取任務標記為 Running，直接結束探測
-                {
-                    let st = state_clone.lock().await;
-                    if *st == ServerStateEnum::Running {
-                        return;
-                    }
-                    if *st == ServerStateEnum::Stopped || *st == ServerStateEnum::Error {
-                        return;
-                    }
-                }
-
-                // 檢查進程是否意外提早退出
-                {
-                    let mut child_guard = child_clone.lock().await;
-                    if let Some(ref mut child) = *child_guard {
-                        if let Ok(Some(_exit_status)) = child.try_wait() {
-                            let mut st = state_clone.lock().await;
-                            *st = ServerStateEnum::Error;
-                            let _ = app_clone3.emit("gufo-status-changed", "error");
-                            return;
-                        }
-                    } else {
-                        return;
-                    }
-                }
-
-                // HTTP GET /health 探測：發送標準 HTTP 請求避免發送未完成的 TCP 連線產生 400 Bad Request
-                let mut req = client.get(&health_url);
-                if !api_key.is_empty() {
-                    req = req.bearer_auth(&api_key);
-                }
-
-                if let Ok(resp) = req.send().await {
-                    if resp.status().is_success() {
-                        let mut st = state_clone.lock().await;
-                        if *st == ServerStateEnum::Starting {
-                            *st = ServerStateEnum::Running;
-                            let _ = app_clone3.emit("gufo-status-changed", "running");
-                        }
-                        return;
-                    }
-                }
-            }
-
-            // 超過嘗試時間仍未連上，檢查進程是否仍在運行
-            let mut st = state_clone.lock().await;
-            if *st == ServerStateEnum::Starting {
-                let mut child_guard = child_clone.lock().await;
-                if let Some(ref mut child) = *child_guard {
-                    if let Ok(None) = child.try_wait() {
-                        *st = ServerStateEnum::Running;
-                        let _ = app_clone3.emit("gufo-status-changed", "running");
-                    } else {
-                        *st = ServerStateEnum::Error;
-                        let _ = app_clone3.emit("gufo-status-changed", "error");
-                    }
-                }
-            }
-        });
-
-        Ok(self.get_status().await)
+        Ok(self.get_status(Some(&app)).await)
     }
 
-    pub async fn stop(&self) -> Result<ServerStatus, String> {
+    pub async fn stop(&self, app: Option<&AppHandle>) -> Result<ServerStatus, String> {
+        *self.state.lock().await = ServerStateEnum::Stopped;
+        *self.is_adopted.lock().await = false;
+        *self.start_time.lock().await = None;
+        *self.error_message.lock().await = None;
+
         let maybe_child = {
             let mut child_guard = self.child.lock().await;
             child_guard.take()
@@ -710,11 +999,13 @@ impl GufoManager {
             self.add_log("[系統] GPU 顯存已完全釋放。".to_string()).await;
         }
 
-        *self.state.lock().await = ServerStateEnum::Stopped;
-        *self.start_time.lock().await = None;
-        *self.error_message.lock().await = None;
+        let cfg = self.config.lock().await.clone();
+        if let Some(app_handle) = app {
+            crate::tray::update_tray_status(app_handle, &ServerStateEnum::Stopped, cfg.port);
+            let _ = app_handle.emit("gufo-status-changed", "stopped");
+        }
 
-        Ok(self.get_status().await)
+        Ok(self.get_status(app).await)
     }
 
     pub async fn kill_orphan_gufo_processes() -> usize {
@@ -820,15 +1111,38 @@ mod tests {
     #[tokio::test]
     async fn test_manager_initial_status() {
         let manager = GufoManager::new();
-        let status = manager.get_status().await;
+        let status = manager.get_status(None).await;
         assert_eq!(status.state, ServerStateEnum::Stopped);
         assert_eq!(status.port, 12223);
         assert_eq!(status.pid, None);
         assert_eq!(status.endpoint, "http://127.0.0.1:12223/v1");
 
         // 測試 stop 不會因為 Mutex 造成死鎖
-        let stop_status = manager.stop().await.unwrap();
+        let stop_status = manager.stop(None).await.unwrap();
         assert_eq!(stop_status.state, ServerStateEnum::Stopped);
+    }
+
+    #[tokio::test]
+    async fn test_unexpected_process_exit_resets_status() {
+        let manager = GufoManager::new();
+        // 模擬啟動一個立即退出的子進程，且狀態為 Running
+        #[cfg(target_os = "windows")]
+        let child = Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap();
+        #[cfg(not(target_os = "windows"))]
+        let child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+
+        *manager.child.lock().await = Some(child);
+        *manager.state.lock().await = ServerStateEnum::Running;
+        *manager.start_time.lock().await = Some(Instant::now());
+
+        // 等待子進程退出
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // 查詢狀態時應自動偵測子進程已不存在，並重置為 Stopped
+        let status = manager.get_status(None).await;
+        assert_eq!(status.state, ServerStateEnum::Stopped);
+        assert_eq!(status.pid, None);
+        assert_eq!(status.uptime_secs, 0);
     }
 
     #[tokio::test]
