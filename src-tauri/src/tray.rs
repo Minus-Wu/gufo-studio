@@ -44,21 +44,21 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 "start_server" => {
                     let app_clone = app.clone();
-                    tokio::spawn(async move {
+                    tauri::async_runtime::spawn(async move {
                         let state = app_clone.state::<crate::AppState>();
                         let _ = state.manager.start(app_clone.clone(), None).await;
                     });
                 }
                 "stop_server" => {
                     let app_clone = app.clone();
-                    tokio::spawn(async move {
+                    tauri::async_runtime::spawn(async move {
                         let state = app_clone.state::<crate::AppState>();
                         let _ = state.manager.stop().await;
                     });
                 }
                 "quit" => {
                     let app_clone = app.clone();
-                    tokio::spawn(async move {
+                    tauri::async_runtime::spawn(async move {
                         if let Some(window) = app_clone.get_webview_window("main") {
                             crate::window_state::save_window_state(&window);
                         }

@@ -60,9 +60,9 @@ pub fn run() {
                 let app_handle = app.handle().clone();
                 let state = app.state::<AppState>();
                 let manager_clone = state.manager.clone();
-                tokio::spawn(async move {
-                    // 稍微延遲 300ms 確保系統匣與事件通道就緒
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                tauri::async_runtime::spawn(async move {
+                    // 稍微延遲 500ms 確保系統匣、前端與事件通道就緒
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     let _ = manager_clone.start(app_handle, None).await;
                 });
             }
