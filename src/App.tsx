@@ -7,11 +7,12 @@ import { Header } from './components/Header';
 import { ChatView } from './components/ChatView';
 import { ConfigView } from './components/ConfigView';
 import { LogsView } from './components/LogsView';
-import { GufoServerConfig, ServerStatus } from './types';
+import { GufoServerConfig, InferenceMetrics, ServerStatus } from './types';
 
 export function App() {
   const [activeTab, setActiveTab] = useState<'chat' | 'config' | 'logs'>('chat');
   const [isStarting, setIsStarting] = useState(false);
+  const [latestMetrics, setLatestMetrics] = useState<InferenceMetrics | null>(null);
 
   const [status, setStatus] = useState<ServerStatus>({
     state: 'stopped',
@@ -83,6 +84,11 @@ export function App() {
 
         const recentLogs = await invoke<string[]>('get_recent_logs');
         setLogs(recentLogs);
+
+        const recentMetrics = await invoke<InferenceMetrics[]>('get_recent_metrics');
+        if (recentMetrics && recentMetrics.length > 0) {
+          setLatestMetrics(recentMetrics[recentMetrics.length - 1]);
+        }
       } catch (err) {
         console.error('初始化失敗:', err);
       }
@@ -93,6 +99,11 @@ export function App() {
     // 監聽後端即時日誌事件
     const unlistenLogPromise = listen<string>('gufo-log', (event) => {
       setLogs((prev) => [...prev.slice(-999), event.payload]);
+    });
+
+    // 監聽推論指標事件 (反應 token/s 與 prefill 速度)
+    const unlistenMetricsPromise = listen<InferenceMetrics>('gufo-metrics', (event) => {
+      setLatestMetrics(event.payload);
     });
 
     // 監聽狀態改變事件
@@ -118,6 +129,7 @@ export function App() {
     return () => {
       clearInterval(interval);
       unlistenLogPromise.then((unlisten) => unlisten());
+      unlistenMetricsPromise.then((unlisten) => unlisten());
       unlistenStatusPromise.then((unlisten) => unlisten());
     };
   }, []);
@@ -176,6 +188,7 @@ export function App() {
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         status={status}
+        latestMetrics={latestMetrics}
         onStartServer={handleStartServer}
         onStopServer={handleStopServer}
         isStarting={isStarting}

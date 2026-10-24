@@ -1,11 +1,25 @@
-import React, { useState } from 'react';
-import { MessageSquare, Settings, Terminal, Play, Square, Copy, Check, Lock } from 'lucide-react';
-import { ServerStatus } from '../types';
+import React, { useState, useEffect } from 'react';
+import {
+  MessageSquare,
+  Settings,
+  Terminal,
+  Play,
+  Square,
+  Copy,
+  Check,
+  Lock,
+  Zap,
+  Clock,
+  Sparkles,
+  Activity,
+} from 'lucide-react';
+import { InferenceMetrics, ServerStatus } from '../types';
 
 interface HeaderProps {
   activeTab: 'chat' | 'config' | 'logs';
   setActiveTab: (tab: 'chat' | 'config' | 'logs') => void;
   status: ServerStatus;
+  latestMetrics?: InferenceMetrics | null;
   onStartServer: () => void;
   onStopServer: () => void;
   isStarting: boolean;
@@ -15,11 +29,22 @@ export const Header: React.FC<HeaderProps> = ({
   activeTab,
   setActiveTab,
   status,
+  latestMetrics,
   onStartServer,
   onStopServer,
   isStarting,
 }) => {
   const [copied, setCopied] = useState(false);
+  const [pulse, setPulse] = useState(false);
+
+  // 當有新的 API 推論指標進來時觸發呼吸燈高亮動畫
+  useEffect(() => {
+    if (latestMetrics) {
+      setPulse(true);
+      const timer = setTimeout(() => setPulse(false), 1200);
+      return () => clearTimeout(timer);
+    }
+  }, [latestMetrics?.timestamp]);
 
   const handleCopyEndpoint = () => {
     navigator.clipboard.writeText(status.endpoint);
@@ -70,6 +95,54 @@ export const Header: React.FC<HeaderProps> = ({
       </nav>
 
       <div className="header-actions">
+        {/* 全局 API 推論效能即時看板（反應 token/s, prefill, TTFT, 投機採納率） */}
+        {latestMetrics && status.state === 'running' && (
+          <div
+            className={`global-metrics-badge ${pulse ? 'metric-pulse' : ''}`}
+            title={`最近 API 請求：${latestMetrics.method} ${latestMetrics.path} (${latestMetrics.duration_ms.toFixed(0)}ms)\n` +
+              `提示詞：${latestMetrics.prompt_tokens} tokens (Prefill: ${latestMetrics.prefill_tps.toFixed(0)} tok/s)\n` +
+              `生成量：${latestMetrics.generated_tokens} tokens (Decode: ${latestMetrics.decode_tps.toFixed(1)} tok/s)\n` +
+              `首字延遲 (TTFT)：${latestMetrics.ttft_ms.toFixed(1)}ms\n` +
+              `MTP 投機解碼命中：${latestMetrics.draft_accepted}/${latestMetrics.draft_proposed}` +
+              (latestMetrics.acceptance_pct != null ? ` (${latestMetrics.acceptance_pct.toFixed(0)}%)` : '')}
+          >
+            <div className="metric-chip decode">
+              <Zap size={13} className="metric-icon zap" />
+              <span className="metric-val">{latestMetrics.decode_tps.toFixed(1)}</span>
+              <span className="metric-unit">tok/s</span>
+            </div>
+
+            <span className="metric-sep">|</span>
+
+            <div className="metric-chip prefill">
+              <Activity size={13} className="metric-icon prefill" />
+              <span className="metric-label">Prefill</span>
+              <span className="metric-val">{latestMetrics.prefill_tps.toFixed(0)}</span>
+              <span className="metric-unit">tok/s</span>
+            </div>
+
+            <span className="metric-sep">|</span>
+
+            <div className="metric-chip ttft">
+              <Clock size={13} className="metric-icon ttft" />
+              <span className="metric-label">TTFT</span>
+              <span className="metric-val">{latestMetrics.ttft_ms.toFixed(0)}</span>
+              <span className="metric-unit">ms</span>
+            </div>
+
+            {latestMetrics.acceptance_pct != null && latestMetrics.draft_proposed > 0 && (
+              <>
+                <span className="metric-sep">|</span>
+                <div className="metric-chip draft">
+                  <Sparkles size={13} className="metric-icon sparkles" />
+                  <span className="metric-label">MTP</span>
+                  <span className="metric-val">{latestMetrics.acceptance_pct.toFixed(0)}%</span>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
         <div
           className="server-badge"
           title={`點擊複製 OpenAI API 端點：${status.endpoint}${status.api_key ? ' (已啟用 API Key 保護)' : ''}`}

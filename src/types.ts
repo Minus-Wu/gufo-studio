@@ -60,3 +60,21 @@ export interface ChatSession {
   createdAt: number;
   updatedAt: number;
 }
+
+export interface InferenceMetrics {
+  request_id: string;
+  method: string;
+  path: string;
+  status: number;
+  duration_ms: number;
+  prompt_tokens: number;
+  prefill_tokens: number;
+  generated_tokens: number;
+  ttft_ms: number;
+  prefill_tps: number;
+  decode_tps: number;
+  draft_accepted: number;
+  draft_proposed: number;
+  acceptance_pct?: number;
+  timestamp: number;
+}

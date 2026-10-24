@@ -77,6 +77,7 @@ pub fn run() {
             commands::stop_server,
             commands::check_health,
             commands::get_recent_logs,
+            commands::get_recent_metrics,
             commands::check_path_exists,
             commands::select_file,
         ])

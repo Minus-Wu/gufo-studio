@@ -1,4 +1,4 @@
-use crate::gufo_manager::{GufoServerConfig, ServerStatus};
+use crate::gufo_manager::{GufoServerConfig, InferenceMetrics, ServerStatus};
 use crate::AppState;
 use tauri::{AppHandle, State};
 
@@ -42,6 +42,11 @@ pub async fn check_health(state: State<'_, AppState>) -> Result<bool, String> {
 #[tauri::command]
 pub async fn get_recent_logs(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     Ok(state.manager.get_logs().await)
+}
+
+#[tauri::command]
+pub async fn get_recent_metrics(state: State<'_, AppState>) -> Result<Vec<InferenceMetrics>, String> {
+    Ok(state.manager.get_metrics().await)
 }
 
 #[tauri::command]

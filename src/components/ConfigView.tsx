@@ -16,6 +16,9 @@ import {
   Info,
   Check,
   Laptop,
+  Terminal,
+  Code,
+  Zap,
 } from 'lucide-react';
 import { GufoServerConfig } from '../types';
 
@@ -32,7 +35,7 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
   onResetDefaults,
   isRunning,
 }) => {
-  const [subTab, setSubTab] = useState<'inference' | 'preferences'>('inference');
+  const [subTab, setSubTab] = useState<'inference' | 'preferences' | 'api_guide'>('inference');
   const [form, setForm] = useState<GufoServerConfig>(initialConfig);
   const [pathStatus, setPathStatus] = useState<{ [key: string]: boolean }>({});
   const [savedSuccess, setSavedSuccess] = useState(false);
@@ -151,6 +154,14 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
               <Check size={12} /> 已即時保存
             </span>
           )}
+        </button>
+        <button
+          type="button"
+          className={`config-nav-btn ${subTab === 'api_guide' ? 'active' : ''}`}
+          onClick={() => setSubTab('api_guide')}
+        >
+          <Terminal size={15} />
+          <span>API 串接與效能速度指南 (API & Metrics)</span>
         </button>
       </div>
 
@@ -643,6 +654,131 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                 <div>
                   <strong>綠色便攜設計</strong>：所有配置檔案（<code>gufo-studio.config.json</code> 與 <code>gufo-studio.window.json</code>）皆存放於執行檔同層工作目錄，複製資料夾即可隨身攜帶使用。
                 </div>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* 分頁三：API 串接與效能速度指南 (API & Metrics) */}
+      {subTab === 'api_guide' && (
+        <>
+          <div className="config-card">
+            <div className="card-title">
+              <Code size={18} color="#38bdf8" />
+              <span>本機 OpenAI 相容端點資訊 (API Endpoint)</span>
+            </div>
+            <div className="card-subtitle">
+              Gufo 提供 100% 相容 OpenAI Chat Completions 標準規格的本機高效能推論 API。
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 12, marginTop: 8 }}>
+              <div style={{ background: 'var(--bg-primary)', padding: '12px 14px', borderRadius: 8, border: '1px solid var(--border-color)' }}>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>API Base URL (端點基礎位址)</div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--accent-cyan)', marginTop: 4 }}>
+                  http://{form.host}:{form.port}/v1
+                </div>
+              </div>
+
+              <div style={{ background: 'var(--bg-primary)', padding: '12px 14px', borderRadius: 8, border: '1px solid var(--border-color)' }}>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>模型名稱 (Model Identifier)</div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--accent-emerald)', marginTop: 4 }}>
+                  {form.served_model_name}
+                </div>
+              </div>
+
+              <div style={{ background: 'var(--bg-primary)', padding: '12px 14px', borderRadius: 8, border: '1px solid var(--border-color)' }}>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>API Key 驗證</div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 600, color: form.api_key ? 'var(--accent-amber)' : 'var(--text-muted)', marginTop: 4 }}>
+                  {form.api_key ? 'Bearer ' + form.api_key.substring(0, 10) + '...' : '未啟用 (免金鑰開放連線)'}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* 方案 A：如何從 API 獲取推論速度與 Prefill 吞吐量 */}
+          <div className="config-card">
+            <div className="card-title">
+              <Zap size={18} color="#f59e0b" />
+              <span>如何在程式與 API 回應中讀取 token/s 與 Prefill 速度 (方案 A)</span>
+            </div>
+            <div className="card-subtitle">
+              底層 Gufo 引擎在每次推論完成時，已於 JSON 回應中原生附帶了完整的時間與吞吐量指標。
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16, marginTop: 8 }}>
+              {/* 方法一：非串流 (JSON) */}
+              <div style={{ background: 'var(--bg-primary)', padding: 14, borderRadius: 8, border: '1px solid var(--border-color)' }}>
+                <div style={{ fontWeight: 600, color: 'var(--text-primary)', marginBottom: 6 }}>
+                  1. 非串流呼叫 (Non-streaming JSON)
+                </div>
+                <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 8 }}>
+                  直接從回傳 JSON 的 <code>response["timings"]</code> 與 <code>response["usage"]</code> 取得精準的吞吐量數據：
+                </p>
+                <pre style={{ background: 'var(--bg-secondary)', padding: '10px 12px', borderRadius: 6, fontSize: 12, fontFamily: 'var(--font-mono)', color: '#38bdf8', overflowX: 'auto' }}>
+{`import requests
+
+url = "http://${form.host}:${form.port}/v1/chat/completions"
+headers = {"Content-Type": "application/json"}
+${form.api_key ? `headers["Authorization"] = "Bearer ${form.api_key}"\n` : ''}
+payload = {
+    "model": "${form.served_model_name}",
+    "messages": [{"role": "user", "content": "請分析這份數據"}],
+    "temperature": 0.0
+}
+
+data = requests.post(url, json=payload, headers=headers).json()
+
+# 直接讀取底層 Gufo 原生計算的吞吐度量：
+prefill_tps = data["timings"]["prompt_per_second"]       # Prefill 處理速度 (tok/s)
+decode_tps  = data["timings"]["predicted_per_second"]    # 生成解碼速度 (tok/s)
+prompt_ms   = data["timings"]["prompt_ms"]               # Prefill 耗時 (ms)
+decode_ms   = data["timings"]["predicted_ms"]            # 生成耗時 (ms)
+
+print(f"🚀 Prefill: {prefill_tps:.1f} tok/s | ⚡ Decode: {decode_tps:.1f} tok/s")`}
+                </pre>
+              </div>
+
+              {/* 方法二：串流模式 (Streaming SSE) */}
+              <div style={{ background: 'var(--bg-primary)', padding: 14, borderRadius: 8, border: '1px solid var(--border-color)' }}>
+                <div style={{ fontWeight: 600, color: 'var(--text-primary)', marginBottom: 6 }}>
+                  2. 串流呼叫 (Streaming SSE)
+                </div>
+                <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 8 }}>
+                  在請求體加入 <code>{'stream_options: {"include_usage": true}'}</code>，或直接讀取最後一個 choice chunk 的 <code>timings</code>：
+                </p>
+                <pre style={{ background: 'var(--bg-secondary)', padding: '10px 12px', borderRadius: 6, fontSize: 12, fontFamily: 'var(--font-mono)', color: '#a7f3d0', overflowX: 'auto' }}>
+{`payload = {
+    "model": "${form.served_model_name}",
+    "messages": [{"role": "user", "content": "寫一篇短文"}],
+    "stream": True,
+    "stream_options": {"include_usage": True} # 開啟使用量與計時 Chunk
+}
+
+with requests.post(url, json=payload, headers=headers, stream=True) as resp:
+    for line in resp.iter_lines():
+        if line.startswith(b"data: ") and not line.endswith(b"[DONE]"):
+            chunk = json.loads(line[6:])
+            # 串流結束時的終端 Chunk 必定自帶 timings 物件：
+            if "timings" in chunk:
+                timings = chunk["timings"]
+                print(f"\\nPrefill: {timings['prompt_per_second']:.1f} tok/s")
+                print(f"Decode:  {timings['predicted_per_second']:.1f} tok/s")`}
+                </pre>
+              </div>
+
+              {/* 方法三：HTTP Header 首字延遲 */}
+              <div style={{ background: 'var(--bg-primary)', padding: 14, borderRadius: 8, border: '1px solid var(--border-color)' }}>
+                <div style={{ fontWeight: 600, color: 'var(--text-primary)', marginBottom: 6 }}>
+                  3. HTTP 回應標頭首字延遲 (Server-Timing Header)
+                </div>
+                <p style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
+                  Gufo 每次回應時均附帶標準 <code>Server-Timing</code> 標頭：
+                  <code style={{ display: 'block', background: 'var(--bg-secondary)', padding: '6px 10px', borderRadius: 4, marginTop: 6, color: '#fde047' }}>
+                    Server-Timing: ttft;dur=10.500, inter_token;dur=31.250, max_inter_token;dur=45.100
+                  </code>
+                  可直接讀取 <code>ttft</code>（Time To First Token 首字延遲，單位為毫秒）。
+                </p>
               </div>
             </div>
           </div>

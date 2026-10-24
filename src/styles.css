@@ -148,6 +148,87 @@ body {
   gap: 12px;
 }
 
+/* 全局即時推論指標徽章 (反應 token/s, prefill, TTFT, 投機採納率) */
+.global-metrics-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  border-radius: 20px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  cursor: default;
+  backdrop-filter: blur(8px);
+}
+
+.global-metrics-badge.metric-pulse {
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 16px rgba(6, 182, 212, 0.45);
+  transform: scale(1.02);
+}
+
+.metric-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.metric-icon.zap {
+  color: var(--accent-cyan);
+}
+
+.metric-icon.prefill {
+  color: #38bdf8;
+}
+
+.metric-icon.ttft {
+  color: var(--accent-amber);
+}
+
+.metric-icon.sparkles {
+  color: #c084fc;
+}
+
+.metric-label {
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.metric-val {
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.metric-chip.decode .metric-val {
+  color: var(--accent-cyan);
+}
+
+.metric-chip.prefill .metric-val {
+  color: #38bdf8;
+}
+
+.metric-chip.ttft .metric-val {
+  color: #fde047;
+}
+
+.metric-chip.draft .metric-val {
+  color: #c084fc;
+}
+
+.metric-unit {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.metric-sep {
+  color: var(--border-color);
+  font-weight: 300;
+  opacity: 0.6;
+}
+
 .server-badge {
   display: flex;
   align-items: center;

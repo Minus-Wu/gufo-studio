@@ -149,6 +149,84 @@ pub struct ServerStatus {
     pub api_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceMetrics {
+    pub request_id: String,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub duration_ms: f64,
+    pub prompt_tokens: u64,
+    pub prefill_tokens: u64,
+    pub generated_tokens: u64,
+    pub ttft_ms: f64,
+    pub prefill_tps: f64,
+    pub decode_tps: f64,
+    pub draft_accepted: u64,
+    pub draft_proposed: u64,
+    pub acceptance_pct: Option<f64>,
+    pub timestamp: u64,
+}
+
+impl InferenceMetrics {
+    pub fn parse_log_line(line: &str) -> Option<Self> {
+        if !line.contains("[http]") || (!line.contains("decode_tps=") && !line.contains("prefill_tps=")) {
+            return None;
+        }
+
+        let mut metrics = Self {
+            request_id: String::new(),
+            method: String::new(),
+            path: String::new(),
+            status: 200,
+            duration_ms: 0.0,
+            prompt_tokens: 0,
+            prefill_tokens: 0,
+            generated_tokens: 0,
+            ttft_ms: 0.0,
+            prefill_tps: 0.0,
+            decode_tps: 0.0,
+            draft_accepted: 0,
+            draft_proposed: 0,
+            acceptance_pct: None,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        };
+
+        for part in line.split_whitespace() {
+            if let Some((k, v)) = part.split_once('=') {
+                match k {
+                    "request" => metrics.request_id = v.to_string(),
+                    "method" => metrics.method = v.to_string(),
+                    "path" => metrics.path = v.to_string(),
+                    "status" => metrics.status = v.parse().unwrap_or(200),
+                    "duration_ms" => metrics.duration_ms = v.parse().unwrap_or(0.0),
+                    "prompt_tokens" => metrics.prompt_tokens = v.parse().unwrap_or(0),
+                    "prefill_tokens" => metrics.prefill_tokens = v.parse().unwrap_or(0),
+                    "generated_tokens" => metrics.generated_tokens = v.parse().unwrap_or(0),
+                    "ttft_ms" => metrics.ttft_ms = v.parse().unwrap_or(0.0),
+                    "prefill_tps" => metrics.prefill_tps = v.parse().unwrap_or(0.0),
+                    "decode_tps" => metrics.decode_tps = v.parse().unwrap_or(0.0),
+                    "draft_accepted" => metrics.draft_accepted = v.parse().unwrap_or(0),
+                    "draft_proposed" => metrics.draft_proposed = v.parse().unwrap_or(0),
+                    "acceptance_pct" => metrics.acceptance_pct = v.parse().ok(),
+                    _ => {}
+                }
+            }
+        }
+
+        if metrics.draft_proposed > 0 && metrics.acceptance_pct.is_none() {
+            metrics.acceptance_pct = Some(
+                (metrics.draft_accepted as f64 * 100.0) / (metrics.draft_proposed as f64),
+            );
+        }
+
+        Some(metrics)
+    }
+}
+
 pub struct GufoManager {
     child: Arc<Mutex<Option<Child>>>,
     config: Arc<Mutex<GufoServerConfig>>,
@@ -156,6 +234,7 @@ pub struct GufoManager {
     start_time: Arc<Mutex<Option<Instant>>>,
     error_message: Arc<Mutex<Option<String>>>,
     recent_logs: Arc<Mutex<VecDeque<String>>>,
+    recent_metrics: Arc<Mutex<VecDeque<InferenceMetrics>>>,
 }
 
 impl GufoManager {
@@ -168,6 +247,7 @@ impl GufoManager {
             start_time: Arc::new(Mutex::new(None)),
             error_message: Arc::new(Mutex::new(None)),
             recent_logs: Arc::new(Mutex::new(VecDeque::with_capacity(1000))),
+            recent_metrics: Arc::new(Mutex::new(VecDeque::with_capacity(50))),
         }
     }
 
@@ -237,6 +317,10 @@ impl GufoManager {
 
     pub async fn get_logs(&self) -> Vec<String> {
         self.recent_logs.lock().await.iter().cloned().collect()
+    }
+
+    pub async fn get_metrics(&self) -> Vec<InferenceMetrics> {
+        self.recent_metrics.lock().await.iter().cloned().collect()
     }
 
     pub fn resolve_path(path_str: &str) -> PathBuf {
@@ -440,6 +524,7 @@ impl GufoManager {
 
         // 啟動 stdout 讀取任務
         let logs_clone1 = self.recent_logs.clone();
+        let metrics_clone1 = self.recent_metrics.clone();
         let state_clone1 = self.state.clone();
         let app_clone1 = app.clone();
         if let Some(stdout) = stdout {
@@ -452,6 +537,16 @@ impl GufoManager {
                     }
                     logs.push_back(line.clone());
                     let _ = app_clone1.emit("gufo-log", line.clone());
+
+                    // 解析推論度量指標（token/s、prefill_tps、ttft_ms 等）
+                    if let Some(metrics) = InferenceMetrics::parse_log_line(&line) {
+                        let mut m = metrics_clone1.lock().await;
+                        if m.len() >= 50 {
+                            m.pop_front();
+                        }
+                        m.push_back(metrics.clone());
+                        let _ = app_clone1.emit("gufo-metrics", metrics);
+                    }
 
                     let line_lower = line.to_lowercase();
                     if line_lower.contains("listening")
@@ -470,6 +565,7 @@ impl GufoManager {
 
         // 啟動 stderr 讀取任務
         let logs_clone2 = self.recent_logs.clone();
+        let metrics_clone2 = self.recent_metrics.clone();
         let state_clone2 = self.state.clone();
         let app_clone2 = app.clone();
         if let Some(stderr) = stderr {
@@ -482,6 +578,16 @@ impl GufoManager {
                     }
                     logs.push_back(line.clone());
                     let _ = app_clone2.emit("gufo-log", line.clone());
+
+                    // 解析推論度量指標（token/s、prefill_tps、ttft_ms 等）
+                    if let Some(metrics) = InferenceMetrics::parse_log_line(&line) {
+                        let mut m = metrics_clone2.lock().await;
+                        if m.len() >= 50 {
+                            m.pop_front();
+                        }
+                        m.push_back(metrics.clone());
+                        let _ = app_clone2.emit("gufo-metrics", metrics);
+                    }
 
                     let line_lower = line.to_lowercase();
                     if line_lower.contains("listening")
@@ -729,6 +835,24 @@ mod tests {
     async fn test_resolve_relative_path() {
         let p = GufoManager::resolve_path("Cargo.toml");
         assert!(p.is_relative() || p.is_absolute());
+    }
+
+    #[test]
+    fn test_parse_metrics_log_line() {
+        let sample = "2026-10-24 14:00:00 [INFO] [http] request=r2 event=completed method=POST path=/v1/chat/completions status=200 duration_ms=4520.5 prompt_tokens=512 prefill_tokens=512 generated_tokens=159 ttft_ms=12.5 prefill_tps=1240.5 decode_tps=31.8 draft_accepted=85 draft_proposed=100 acceptance_pct=85.0";
+        let parsed = InferenceMetrics::parse_log_line(sample).expect("Should parse successfully");
+        assert_eq!(parsed.request_id, "r2");
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(parsed.path, "/v1/chat/completions");
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.prompt_tokens, 512);
+        assert_eq!(parsed.generated_tokens, 159);
+        assert!((parsed.prefill_tps - 1240.5).abs() < 0.01);
+        assert!((parsed.decode_tps - 31.8).abs() < 0.01);
+        assert!((parsed.ttft_ms - 12.5).abs() < 0.01);
+        assert_eq!(parsed.draft_accepted, 85);
+        assert_eq!(parsed.draft_proposed, 100);
+        assert_eq!(parsed.acceptance_pct, Some(85.0));
     }
 }
 
