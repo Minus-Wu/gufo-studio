@@ -22,8 +22,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rfd = "0.17.2"
 
 [profile.release]
-codegen-units = 1
-lto = true
 opt-level = 3
+lto = "thin"
+codegen-units = 16
 panic = "abort"
 strip = true
