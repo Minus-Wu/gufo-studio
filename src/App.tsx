@@ -196,7 +196,7 @@ export function App() {
 
       <main className="app-body">
         {activeTab === 'chat' && (
-          <ChatView status={status} onStartServer={handleStartServer} />
+          <ChatView status={status} />
         )}
         {activeTab === 'config' && (
           <ConfigView

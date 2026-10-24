@@ -284,6 +284,15 @@ body {
   user-select: none;
 }
 
+.btn:disabled,
+.btn[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed !important;
+  pointer-events: none;
+  filter: grayscale(0.5);
+  box-shadow: none !important;
+}
+
 .btn-primary {
   background: linear-gradient(135deg, #2563eb, #1d4ed8);
   color: white;
@@ -591,6 +600,11 @@ body {
 }
 .chat-textarea::placeholder {
   color: var(--text-muted);
+}
+
+.chat-textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 /* Config Layout */

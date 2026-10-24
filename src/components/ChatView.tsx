@@ -18,10 +18,10 @@ import { ChatMessage, MessageImage, ServerStatus } from '../types';
 
 interface ChatViewProps {
   status: ServerStatus;
-  onStartServer: () => void;
+  onStartServer?: () => void;
 }
 
-export const ChatView: React.FC<ChatViewProps> = ({ status, onStartServer }) => {
+export const ChatView: React.FC<ChatViewProps> = ({ status }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: 'welcome',
@@ -96,10 +96,7 @@ export const ChatView: React.FC<ChatViewProps> = ({ status, onStartServer }) => 
   };
 
   const handleSend = async () => {
-    if ((!input.trim() && images.length === 0) || isGenerating) return;
-
-    if (status.state !== 'running') {
-      alert('Gufo 伺服器尚未運行，請點擊右上角「啟動伺服器」後再進行對話。');
+    if ((!input.trim() && images.length === 0) || isGenerating || status.state !== 'running') {
       return;
     }
 
@@ -431,6 +428,8 @@ export const ChatView: React.FC<ChatViewProps> = ({ status, onStartServer }) => 
             placeholder={
               status.state === 'running'
                 ? '輸入訊息... (Shift+Enter 換行，Ctrl+V 可直接貼上圖片截圖)'
+                : status.state === 'starting'
+                ? '伺服器載入模型中，請稍候...'
                 : '伺服器未啟動，請點擊右上角「啟動伺服器」'
             }
             rows={1}
@@ -441,16 +440,12 @@ export const ChatView: React.FC<ChatViewProps> = ({ status, onStartServer }) => 
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
-                handleSend();
+                if (status.state === 'running') {
+                  handleSend();
+                }
               }
             }}
           />
-
-          {status.state !== 'running' && (
-            <button className="btn btn-emerald" onClick={onStartServer} title="點擊立即啟動伺服器">
-              <span>啟動伺服器</span>
-            </button>
-          )}
 
           {isGenerating ? (
             <button className="btn btn-danger" onClick={handleStopGenerating} title="停止生成">
@@ -461,7 +456,14 @@ export const ChatView: React.FC<ChatViewProps> = ({ status, onStartServer }) => 
             <button
               className="btn btn-primary"
               onClick={handleSend}
-              disabled={(!input.trim() && images.length === 0) || status.state !== 'running'}
+              disabled={status.state !== 'running' || (!input.trim() && images.length === 0)}
+              title={
+                status.state === 'running'
+                  ? '傳送訊息 (Enter)'
+                  : status.state === 'starting'
+                  ? '伺服器載入模型中，暫時無法傳送'
+                  : '伺服器未啟動，請先於右上角啟動伺服器'
+              }
             >
               <Send size={15} />
             </button>
