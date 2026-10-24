@@ -280,6 +280,45 @@ impl GufoManager {
         }
         let cfg = self.config.lock().await.clone();
 
+        // 啟動前檢查：目標 host:port 是否已有活著的 Gufo 伺服器（例如先前實例啟動）
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(600))
+            .build()
+            .unwrap_or_default();
+        let health_url = format!("http://{}:{}/health", cfg.host, cfg.port);
+        let mut req = client.get(&health_url);
+        if !cfg.api_key.trim().is_empty() {
+            req = req.bearer_auth(cfg.api_key.trim());
+        }
+
+        if let Ok(resp) = req.send().await {
+            if resp.status().is_success() {
+                self.add_log(format!(
+                    "[系統] 偵測到 Port {} 已有運行的 Gufo 伺服器，已自動接管該服務，避免重複啟動耗損顯存。",
+                    cfg.port
+                ))
+                .await;
+                *self.state.lock().await = ServerStateEnum::Running;
+                *self.start_time.lock().await = Some(Instant::now());
+                *self.error_message.lock().await = None;
+                let _ = app.emit("gufo-status-changed", "running");
+                return Ok(self.get_status().await);
+            }
+        }
+
+        // 若不是合法的 Gufo 伺服器但該 Port 已被佔用，提早阻擋避免衝突
+        if tokio::net::TcpStream::connect((cfg.host.as_str(), cfg.port)).await.is_ok() {
+            let err_msg = format!(
+                "Port {} 目前已被佔用但無法通過健康檢查，請確認是否有異常殘留程序或更換 Port",
+                cfg.port
+            );
+            self.add_log(format!("[錯誤] {}", err_msg)).await;
+            *self.state.lock().await = ServerStateEnum::Error;
+            *self.error_message.lock().await = Some(err_msg.clone());
+            let _ = app.emit("gufo-status-changed", "error");
+            return Err(err_msg);
+        }
+
         let resolved_gufo = Self::resolve_path(&cfg.gufo_path);
         let resolved_model = Self::resolve_path(&cfg.model_path);
 
@@ -550,7 +589,19 @@ impl GufoManager {
             self.add_log("[系統] 正在停止 Gufo 推理引擎...".to_string()).await;
             let _ = child.kill().await;
             let _ = child.wait().await;
-            self.add_log("[系統] Gufo 推理引擎已停止，GPU 顯存已釋放。".to_string()).await;
+            self.add_log("[系統] Gufo 子進程已終止。".to_string()).await;
+        }
+
+        // 清理背景可能殘留的孤兒 gufo 進程（確保 Strix Halo 96GB 顯存完全釋放）
+        let killed_count = Self::kill_orphan_gufo_processes().await;
+        if killed_count > 0 {
+            self.add_log(format!(
+                "[系統] 已清理背景殘留的 {} 個 gufo 進程，GPU 顯存已完全釋放。",
+                killed_count
+            ))
+            .await;
+        } else {
+            self.add_log("[系統] GPU 顯存已完全釋放。".to_string()).await;
         }
 
         *self.state.lock().await = ServerStateEnum::Stopped;
@@ -560,11 +611,62 @@ impl GufoManager {
         Ok(self.get_status().await)
     }
 
+    pub async fn kill_orphan_gufo_processes() -> usize {
+        #[cfg(target_os = "windows")]
+        {
+            tokio::task::spawn_blocking(|| {
+                use std::os::windows::process::CommandExt;
+                let mut check_cmd = std::process::Command::new("tasklist");
+                check_cmd.args(&["/FI", "IMAGENAME eq gufo.exe", "/NH"]);
+                check_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                if let Ok(output) = check_cmd.output() {
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    if text.contains("gufo.exe") {
+                        let mut kill_cmd = std::process::Command::new("taskkill");
+                        kill_cmd.args(&["/F", "/IM", "gufo.exe"]);
+                        kill_cmd.creation_flags(0x08000000);
+                        let _ = kill_cmd.output();
+                        return 1;
+                    }
+                }
+                0
+            })
+            .await
+            .unwrap_or(0)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            tokio::task::spawn_blocking(|| {
+                let mut kill_cmd = std::process::Command::new("pkill");
+                kill_cmd.args(&["-9", "-x", "gufo"]);
+                if let Ok(status) = kill_cmd.status() {
+                    if status.success() {
+                        return 1;
+                    }
+                }
+                0
+            })
+            .await
+            .unwrap_or(0)
+        }
+    }
+
     pub async fn check_health(&self) -> bool {
         let cfg = self.config.lock().await.clone();
-        tokio::net::TcpStream::connect((cfg.host.as_str(), cfg.port))
-            .await
-            .is_ok()
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(600))
+            .build()
+            .unwrap_or_default();
+        let health_url = format!("http://{}:{}/health", cfg.host, cfg.port);
+        let mut req = client.get(&health_url);
+        if !cfg.api_key.trim().is_empty() {
+            req = req.bearer_auth(cfg.api_key.trim());
+        }
+        if let Ok(resp) = req.send().await {
+            resp.status().is_success()
+        } else {
+            false
+        }
     }
 
     async fn add_log(&self, line: String) {
