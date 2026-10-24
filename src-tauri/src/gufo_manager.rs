@@ -459,12 +459,19 @@ impl GufoManager {
             });
         }
 
-        // 啟動健康檢查背景監控 (以 TCP 探測連接)
+        // 啟動健康檢查背景監控 (以標準 HTTP GET /health 探測，避免發送空 TCP 封包引發 400 bad_request)
         let state_clone = self.state.clone();
         let child_clone = self.child.clone();
         let host = cfg.host.clone();
         let port = cfg.port;
+        let api_key = cfg.api_key.trim().to_string();
         let app_clone3 = app.clone();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(800))
+            .build()
+            .unwrap_or_default();
+        let health_url = format!("http://{}:{}/health", host, port);
+
         tokio::spawn(async move {
             // 每 500ms 檢查一次，最多嘗試 240 次 (約 2 分鐘，適合大模型載入)
             for _ in 0..240 {
@@ -496,14 +503,21 @@ impl GufoManager {
                     }
                 }
 
-                // TCP 探測：一旦 port 開放連線，代表模型載入完畢且伺服器已就緒
-                if tokio::net::TcpStream::connect((host.as_str(), port)).await.is_ok() {
-                    let mut st = state_clone.lock().await;
-                    if *st == ServerStateEnum::Starting {
-                        *st = ServerStateEnum::Running;
-                        let _ = app_clone3.emit("gufo-status-changed", "running");
+                // HTTP GET /health 探測：發送標準 HTTP 請求避免發送未完成的 TCP 連線產生 400 Bad Request
+                let mut req = client.get(&health_url);
+                if !api_key.is_empty() {
+                    req = req.bearer_auth(&api_key);
+                }
+
+                if let Ok(resp) = req.send().await {
+                    if resp.status().is_success() {
+                        let mut st = state_clone.lock().await;
+                        if *st == ServerStateEnum::Starting {
+                            *st = ServerStateEnum::Running;
+                            let _ = app_clone3.emit("gufo-status-changed", "running");
+                        }
+                        return;
                     }
-                    return;
                 }
             }
 
