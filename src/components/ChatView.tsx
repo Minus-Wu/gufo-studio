@@ -14,14 +14,55 @@ import {
   Clock,
   X,
 } from 'lucide-react';
-import { ChatMessage, MessageImage, ServerStatus } from '../types';
+import { ChatMessage, ChatMetrics, MessageImage, ServerStatus } from '../types';
 
 interface ChatViewProps {
   status: ServerStatus;
-  onStartServer?: () => void;
+  /** 對話預設思考模式 (來自伺服器設定的 --think) */
+  defaultThink?: boolean;
+  /** 對話預設採樣溫度 (來自伺服器設定的 --temperature) */
+  defaultTemperature?: number;
 }
 
-export const ChatView: React.FC<ChatViewProps> = ({ status }) => {
+const round1 = (n: number) => Math.round(n * 10) / 10;
+const num = (v: unknown): number | undefined =>
+  typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+
+/** 合併 Gufo 串流終端 chunk 的 timings 與 include_usage 的 usage，轉成伺服器端精確指標 */
+function buildServerMetrics(
+  timings: any,
+  usage: any,
+  clientTtftMs: number | undefined
+): ChatMetrics {
+  const t = timings ?? {};
+  const u = usage ?? {};
+  const prefillTokens = num(t.prompt_n);
+  const cachedTokens =
+    num(u.prompt_tokens_details?.cached_tokens) ?? num(u.cached_tokens) ?? num(t.cache_n);
+  const promptTokens =
+    num(u.prompt_tokens) ??
+    (prefillTokens !== undefined ? prefillTokens + (cachedTokens ?? 0) : undefined);
+  const decodeTps = num(t.predicted_per_second) ?? num(u.completion_tokens_per_second);
+  const prefillTps = num(t.prompt_per_second) ?? num(u.prompt_tokens_per_second);
+  return {
+    approximate: false,
+    completionTokens: num(u.completion_tokens) ?? num(t.predicted_n),
+    tokensPerSec: decodeTps !== undefined ? round1(decodeTps) : undefined,
+    ttftMs: num(u.gufo?.ttft_ms) ?? clientTtftMs,
+    promptTokens,
+    prefillTokens,
+    prefillTps: prefillTps !== undefined && (prefillTokens ?? 1) > 0 ? round1(prefillTps) : undefined,
+    cachedTokens,
+    draftTokens: num(t.draft_n) ?? num(u.draft_tokens),
+    draftAccepted: num(t.draft_n_accepted) ?? num(u.draft_tokens_accepted),
+  };
+}
+
+export const ChatView: React.FC<ChatViewProps> = ({
+  status,
+  defaultThink = false,
+  defaultTemperature = 0,
+}) => {
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: 'welcome',
@@ -29,27 +70,44 @@ export const ChatView: React.FC<ChatViewProps> = ({ status }) => {
       content:
         '你好！我是 **Gufo Studio**，本機以 AMD Strix Halo (Ryzen AI MAX+ 395) 硬體深度優化推論。\n\n目前預設支援 **Qwen3.8-Flash-Next (128K Vision)** 投機加速推論。你可以隨時傳送訊息、貼上圖片截圖，或是使用上方控制列調整思考模式！',
       timestamp: Date.now(),
+      excludeFromContext: true,
     },
   ]);
 
   const [input, setInput] = useState('');
   const [images, setImages] = useState<MessageImage[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [thinkMode, setThinkMode] = useState(false);
-  const [temperature, setTemperature] = useState(0.0);
+  const [thinkMode, setThinkMode] = useState(defaultThink);
+  const [temperature, setTemperature] = useState(defaultTemperature);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
+  // 伺服器設定變更時同步對話預設值
+  useEffect(() => {
+    setThinkMode(defaultThink);
+  }, [defaultThink]);
 
   useEffect(() => {
-    scrollToBottom();
+    setTemperature(defaultTemperature);
+  }, [defaultTemperature]);
+
+  const handleMessagesScroll = () => {
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
+
+  // 只在使用者停留在底部時自動捲動，避免串流時搶走捲軸
+  useEffect(() => {
+    const el = messagesContainerRef.current;
+    if (el && stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [messages]);
 
   const handleCopy = (id: string, text: string) => {
@@ -110,7 +168,7 @@ export const ChatView: React.FC<ChatViewProps> = ({ status }) => {
     };
 
     const newMessages = [...messages, userMessage];
-    setMessages(newMessages);
+    stickToBottomRef.current = true;
     setInput('');
     setImages([]);
     setIsGenerating(true);
@@ -123,25 +181,34 @@ export const ChatView: React.FC<ChatViewProps> = ({ status }) => {
       timestamp: Date.now(),
     };
 
-    setMessages((prev) => [...prev, assistantMessage]);
+    setMessages([...newMessages, assistantMessage]);
 
-    // 格式化 OpenAI 對話歷史
-    const apiMessages = newMessages.map((msg) => {
-      if (msg.images && msg.images.length > 0) {
-        const contentParts: any[] = [];
-        if (msg.content) {
-          contentParts.push({ type: 'text', text: msg.content });
+    // 格式化 OpenAI 對話歷史 (排除歡迎訊息、錯誤提示與空白回覆)
+    const apiMessages = newMessages
+      .filter(
+        (msg) =>
+          !msg.excludeFromContext &&
+          !(msg.role === 'assistant' && !msg.content.trim())
+      )
+      .map((msg) => {
+        if (msg.images && msg.images.length > 0) {
+          const contentParts: any[] = [];
+          if (msg.content) {
+            contentParts.push({ type: 'text', text: msg.content });
+          }
+          for (const img of msg.images) {
+            contentParts.push({
+              type: 'image_url',
+              image_url: { url: img.url },
+            });
+          }
+          return { role: msg.role, content: contentParts };
         }
-        for (const img of msg.images) {
-          contentParts.push({
-            type: 'image_url',
-            image_url: { url: img.url },
-          });
+        if (msg.role === 'assistant' && msg.reasoning) {
+          return { role: msg.role, content: msg.content, reasoning_content: msg.reasoning };
         }
-        return { role: msg.role, content: contentParts };
-      }
-      return { role: msg.role, content: msg.content };
-    });
+        return { role: msg.role, content: msg.content };
+      });
 
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
@@ -150,7 +217,43 @@ export const ChatView: React.FC<ChatViewProps> = ({ status }) => {
     let firstTokenTime: number | null = null;
     let accumulatedContent = '';
     let accumulatedReasoning = '';
-    let tokenCount = 0;
+    let chunkCount = 0;
+    let finalTimings: any = null;
+    let finalUsage: any = null;
+    let frameHandle: number | null = null;
+
+    const patchAssistant = (patch: Partial<ChatMessage>) => {
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantMsgId ? { ...m, ...patch } : m))
+      );
+    };
+
+    // 以 requestAnimationFrame 節流 UI 更新，避免每個 token 都觸發 Markdown 重繪
+    const scheduleFlush = () => {
+      if (frameHandle !== null) return;
+      frameHandle = requestAnimationFrame(() => {
+        frameHandle = null;
+        const now = performance.now();
+        const elapsedSec = firstTokenTime ? (now - firstTokenTime) / 1000 : 0;
+        patchAssistant({
+          content: accumulatedContent,
+          reasoning: accumulatedReasoning || undefined,
+          metrics: {
+            approximate: true,
+            completionTokens: chunkCount,
+            tokensPerSec: elapsedSec > 0.2 ? round1(chunkCount / elapsedSec) : undefined,
+            ttftMs: firstTokenTime ? Math.round(firstTokenTime - startTime) : undefined,
+          },
+        });
+      });
+    };
+
+    const cancelFlush = () => {
+      if (frameHandle !== null) {
+        cancelAnimationFrame(frameHandle);
+        frameHandle = null;
+      }
+    };
 
     try {
       const headers: Record<string, string> = {
@@ -167,16 +270,26 @@ export const ChatView: React.FC<ChatViewProps> = ({ status }) => {
           model: status.served_model_name || 'flash-next',
           messages: apiMessages,
           stream: true,
+          stream_options: { include_usage: true },
           temperature: temperature,
-          extra_body: {
-            think: thinkMode ? 'on' : 'off',
-          },
+          // Gufo 以 chat_template_kwargs.enable_thinking 逐請求控制思考鏈
+          chat_template_kwargs: { enable_thinking: thinkMode },
         }),
         signal: abortController.signal,
       });
 
       if (!response.ok) {
-        throw new Error(`HTTP 錯誤: ${response.status} ${response.statusText}`);
+        const bodyText = await response.text().catch(() => '');
+        let detail = bodyText.trim();
+        try {
+          const parsed = JSON.parse(bodyText);
+          detail = parsed?.error?.message || parsed?.message || detail;
+        } catch {
+          // 非 JSON 錯誤內容，保留原文
+        }
+        throw new Error(
+          `HTTP ${response.status} ${response.statusText}${detail ? `：${detail.slice(0, 500)}` : ''}`
+        );
       }
 
       const reader = response.body?.getReader();
@@ -185,8 +298,9 @@ export const ChatView: React.FC<ChatViewProps> = ({ status }) => {
       if (!reader) throw new Error('無法取得回傳流');
 
       let buffer = '';
+      let streamDone = false;
 
-      while (true) {
+      while (!streamDone) {
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -196,66 +310,72 @@ export const ChatView: React.FC<ChatViewProps> = ({ status }) => {
 
         for (const line of lines) {
           const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith('data: ')) continue;
-          if (trimmed === 'data: [DONE]') break;
-
-          try {
-            const json = JSON.parse(trimmed.slice(6));
-            const delta = json.choices?.[0]?.delta;
-            if (!delta) continue;
-
-            if (firstTokenTime === null) {
-              firstTokenTime = performance.now();
-            }
-
-            // 支援思考鏈標籤或 reasoning_content
-            if (delta.reasoning_content) {
-              accumulatedReasoning += delta.reasoning_content;
-            } else if (delta.content) {
-              accumulatedContent += delta.content;
-              tokenCount++;
-            }
-
-            const now = performance.now();
-            const elapsedSec = (now - (firstTokenTime || startTime)) / 1000;
-            const tps = elapsedSec > 0 ? Math.round((tokenCount / elapsedSec) * 10) / 10 : 0;
-            const ttft = firstTokenTime ? Math.round(firstTokenTime - startTime) : undefined;
-
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === assistantMsgId
-                  ? {
-                      ...m,
-                      content: accumulatedContent,
-                      reasoning: accumulatedReasoning || undefined,
-                      metrics: {
-                        totalTokens: tokenCount,
-                        tokensPerSec: tps,
-                        ttftMs: ttft,
-                      },
-                    }
-                  : m
-              )
-            );
-          } catch (e) {
-            // 忽略單行 JSON 解析錯誤
+          if (!trimmed.startsWith('data:')) continue;
+          const payload = trimmed.slice(5).trim();
+          if (payload === '[DONE]') {
+            streamDone = true;
+            break;
           }
+
+          let json: any;
+          try {
+            json = JSON.parse(payload);
+          } catch {
+            continue;
+          }
+
+          if (json.error) {
+            throw new Error(json.error.message || JSON.stringify(json.error));
+          }
+          // include_usage 的最後一個 chunk 的 choices 為空陣列，需在 delta 判斷之前處理
+          if (json.usage) finalUsage = json.usage;
+          const choice = json.choices?.[0];
+          const timings = json.timings ?? choice?.timings;
+          if (timings) finalTimings = timings;
+
+          const delta = choice?.delta;
+          if (!delta) continue;
+
+          const reasoningPiece = delta.reasoning_content || delta.reasoning || '';
+          const contentPiece = delta.content || '';
+          if (!reasoningPiece && !contentPiece) continue;
+
+          if (firstTokenTime === null) {
+            firstTokenTime = performance.now();
+          }
+          accumulatedReasoning += reasoningPiece;
+          accumulatedContent += contentPiece;
+          chunkCount++;
+          scheduleFlush();
         }
       }
+
+      cancelFlush();
+      const clientTtft = firstTokenTime ? Math.round(firstTokenTime - startTime) : undefined;
+      const hasServerMetrics = !!(finalTimings || finalUsage);
+      patchAssistant({
+        content: accumulatedContent,
+        reasoning: accumulatedReasoning || undefined,
+        metrics: hasServerMetrics
+          ? buildServerMetrics(finalTimings, finalUsage, clientTtft)
+          : { approximate: true, completionTokens: chunkCount, ttftMs: clientTtft },
+      });
     } catch (err: any) {
-      if (err.name !== 'AbortError') {
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantMsgId
-              ? {
-                  ...m,
-                  content:
-                    accumulatedContent ||
-                    `⚠️ 連線請求失敗：${err.message || '請確認伺服器狀態與埠號是否正確'}`,
-                }
-              : m
-          )
-        );
+      cancelFlush();
+      if (err.name === 'AbortError') {
+        patchAssistant({
+          content: accumulatedContent,
+          reasoning: accumulatedReasoning || undefined,
+          excludeFromContext: !accumulatedContent.trim(),
+        });
+      } else {
+        const errorText = `⚠️ 連線請求失敗：${err.message || '請確認伺服器狀態與埠號是否正確'}`;
+        patchAssistant({
+          content: accumulatedContent ? `${accumulatedContent}\n\n${errorText}` : errorText,
+          reasoning: accumulatedReasoning || undefined,
+          isError: true,
+          excludeFromContext: true,
+        });
       }
     } finally {
       setIsGenerating(false);
@@ -270,10 +390,66 @@ export const ChatView: React.FC<ChatViewProps> = ({ status }) => {
     }
   };
 
+  const renderMetrics = (m: ChatMetrics) => {
+    const items: React.ReactNode[] = [];
+    if (m.tokensPerSec !== undefined) {
+      items.push(
+        <span
+          key="tps"
+          style={{ display: 'flex', alignContent: 'center', gap: 3 }}
+          title={
+            m.approximate
+              ? '串流中前端估算 (以 SSE chunk 數計，非精確 token 數)'
+              : '伺服器量測的解碼速度 (decode tok/s)'
+          }
+        >
+          <Zap size={11} color="#06b6d4" />
+          {m.approximate ? '≈' : ''}
+          {m.tokensPerSec} tok/s
+        </span>
+      );
+    }
+    if (m.ttftMs !== undefined) {
+      items.push(
+        <span key="ttft" style={{ display: 'flex', alignContent: 'center', gap: 3 }}>
+          <Clock size={11} color="#f59e0b" />
+          首字延遲 {Math.round(m.ttftMs)}ms
+        </span>
+      );
+    }
+    if (!m.approximate && m.prefillTps !== undefined) {
+      items.push(
+        <span key="prefill" title={`實際 prefill ${m.prefillTokens ?? '?'} tokens`}>
+          Prefill {m.prefillTps} tok/s
+        </span>
+      );
+    }
+    if (m.completionTokens !== undefined) {
+      items.push(
+        <span key="tokens">
+          {m.approximate
+            ? `≈ ${m.completionTokens} chunks`
+            : `${m.promptTokens !== undefined ? `輸入 ${m.promptTokens} / ` : ''}輸出 ${m.completionTokens} tokens`}
+        </span>
+      );
+    }
+    if (!m.approximate && m.cachedTokens) {
+      items.push(<span key="cache">快取命中 {m.cachedTokens} tokens</span>);
+    }
+    if (!m.approximate && m.draftTokens && m.draftAccepted !== undefined) {
+      items.push(
+        <span key="mtp" title={`MTP 草稿接受 ${m.draftAccepted}/${m.draftTokens}`}>
+          MTP 接受率 {Math.round((m.draftAccepted / m.draftTokens) * 100)}%
+        </span>
+      );
+    }
+    return items.length > 0 ? <div className="message-metrics">{items}</div> : null;
+  };
+
   return (
     <div className="chat-container">
       {/* 訊息流列表 */}
-      <div className="chat-messages">
+      <div className="chat-messages" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
         {messages.map((msg) => (
           <div key={msg.id} className="message-row">
             <div className={`message-avatar ${msg.role}`}>
@@ -328,26 +504,11 @@ export const ChatView: React.FC<ChatViewProps> = ({ status }) => {
                 </div>
 
                 {/* 生成速率指標 */}
-                {msg.metrics && msg.metrics.tokensPerSec !== undefined && (
-                  <div className="message-metrics">
-                    <span style={{ display: 'flex', alignContent: 'center', gap: 3 }}>
-                      <Zap size={11} color="#06b6d4" />
-                      {msg.metrics.tokensPerSec} tokens/s
-                    </span>
-                    {msg.metrics.ttftMs && (
-                      <span style={{ display: 'flex', alignContent: 'center', gap: 3 }}>
-                        <Clock size={11} color="#f59e0b" />
-                        首字延遲 {msg.metrics.ttftMs}ms
-                      </span>
-                    )}
-                    <span>共 {msg.metrics.totalTokens} tokens</span>
-                  </div>
-                )}
+                {msg.metrics && renderMetrics(msg.metrics)}
               </div>
             </div>
           </div>
         ))}
-        <div ref={messagesEndRef} />
       </div>
 
       {/* 輸入區塊 */}

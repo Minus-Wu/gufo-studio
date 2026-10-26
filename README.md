@@ -16,9 +16,10 @@
 
 2. **極速對話介面 (Chat Interface)**：
    - 本機直連 OpenAI-compatible API (`http://127.0.0.1:12223/v1`)。
-   - 支援 SSE 串流逐字輸出（Streaming Response）。
-   - 即時計算推論速率（Tokens/s）與首字延遲（TTFT）。
-   - 支援思考鏈（Thinking / Reasoning on/off）即時切換。
+   - 支援 SSE 串流逐字輸出（Streaming Response），以 requestAnimationFrame 節流重繪。
+   - 回覆完成後顯示**伺服器量測**的解碼速率、Prefill 速率、TTFT、輸入/輸出 tokens、快取命中與 MTP 接受率；串流中顯示的 `≈ tok/s` 為前端以 SSE chunk 數估算的近似值。
+   - 思考鏈開關以 `chat_template_kwargs.enable_thinking` 逐請求控制（預設值跟隨伺服器設定的 `--think`）。
+   - 歡迎訊息與錯誤提示不會送入模型對話歷史；先前回覆的 `reasoning_content` 會一併回傳。
    - 支援 Markdown 語法渲染、代碼語法高亮與一鍵複製。
    - 多模態視覺支援（Vision / mmproj）：可貼上截圖或上傳圖片。
 
@@ -40,6 +41,37 @@
 5. **即時日誌流與狀態儀表板 (Live Logs & Dashboard)**：
    - 即時捕捉 Gufo 的 stdout / stderr。
    - 查看 AMD ROCm 初始化、GPU VRAM 記憶體佔用與模型分塊進度。
+   - 日誌中的啟動命令會自動遮蔽 `--api-key` 的值。
+
+6. **可調整的進階推論參數**：
+   - `--max-tokens`（預設生成上限）、`--draft-tokens`、`--mtp-draft-vocab full|latin`、`--prefill-chunk`、`--prompt-lookup`、預設 `--temperature`。
+   - 磁碟 Prompt 快取：`--cache-disk <DIR>` 與 `--cache-disk-bytes`。
+   - 數值為 0 表示不傳該參數、交給 Gufo 預設值。
+
+---
+
+## ⚙️ 設定與程序管理
+
+- **單一設定來源**：所有設定存於執行檔旁的 `gufo-studio.config.json`。舊版存在 WebView localStorage 的設定會在首次啟動時自動遷移並清除；「還原預設配置」會同時寫回設定檔。舊版設定檔缺少的新欄位會自動補上預設值。
+- **就緒判斷**：以 Gufo 的 `/ready` 端點（舊版退回 `/health`）與日誌中的 `event=listening` 判斷模型載入完成，不設硬性啟動逾時（大型模型在較小 carve-out 下可能需數分鐘）。
+- **安全停止**：只會停止由 Gufo Studio 啟動的子程序，或「在設定埠號上監聽、且映像檔名稱符合 gufo 的程序」，不再以 `taskkill /IM` 依名稱終止所有同名程序。停止時先送出 Ctrl+C 讓 Gufo 優雅釋放 GPU 記憶體，15 秒內未結束才強制終止。
+- 視窗位置/大小的儲存已去抖動（debounce），不會在拖曳時持續寫檔。
+
+## 📊 效能預期（與 Gufo 宣稱數據的差異）
+
+Gufo README 的峰值數據（例如 prefill ≈ 1600 tok/s、單路 decode ≈ 59 tok/s、8 路並發總吞吐 ≈ 157 tok/s）是在 Linux、96GB carve-out、重複性高的基準文字下量測。Windows 上以一般中英文混合內容實測較常見的範圍為：
+
+| 指標 | 典型範圍 (Windows, Flash-Next, MTP) |
+|------|-------------------------------------|
+| Prefill | 約 680–840 tok/s |
+| 單路 Decode | 約 32–35 tok/s |
+
+影響因素：
+- **carve-out 小於 96GB** 時，載入時間變長（64GB 約 2 分鐘）且 decode 變慢。
+- **context × sessions** 決定預先配置的 KV 快取大小；Flash-Next 256K 單會話約需 89 GiB。
+- `--mtp-policy survival` 只在 temperature > 0 時生效。
+- `--mtp-draft-vocab latin` 只適合英文/程式碼輸出，中文輸出會降低 MTP 接受率。
+- 聊天頁面顯示的是伺服器回傳的 `timings` / `usage`，可直接與 Gufo 日誌中的 `decode_tps`、`prefill_tps` 對照。
 
 ---
 

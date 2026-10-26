@@ -1,10 +1,22 @@
-use crate::gufo_manager::{GufoServerConfig, InferenceMetrics, ServerStatus};
+use crate::gufo_manager::{GufoManager, GufoServerConfig, InferenceMetrics, ServerStatus};
 use crate::AppState;
 use tauri::{AppHandle, State};
 
+/// 出廠預設配置 (用於「還原預設配置」)。
 #[tauri::command]
-pub async fn get_default_config(state: State<'_, AppState>) -> Result<GufoServerConfig, String> {
+pub fn get_default_config() -> GufoServerConfig {
+    GufoServerConfig::default()
+}
+
+/// 目前生效的配置 (以 gufo-studio.config.json 為唯一來源)。
+#[tauri::command]
+pub async fn get_config(state: State<'_, AppState>) -> Result<GufoServerConfig, String> {
     Ok(state.manager.get_config().await)
+}
+
+#[tauri::command]
+pub fn has_saved_config() -> bool {
+    GufoManager::has_saved_config()
 }
 
 #[tauri::command]

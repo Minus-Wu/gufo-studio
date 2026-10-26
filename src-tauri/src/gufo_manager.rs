@@ -1,15 +1,27 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+use crate::process_control;
+
+const MAX_LOG_LINES: usize = 1000;
+const MAX_METRICS: usize = 50;
+/// 正常關閉 (Ctrl+C / SIGINT) 的等待上限；Gufo 會在此期間排空磁碟快取寫入。
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+/// 模型載入超過此時間仍未就緒時，於日誌提示可能的原因 (不會中斷載入)。
+const SLOW_LOAD_HINT_AFTER: Duration = Duration::from_secs(180);
+
+/// 缺少的欄位一律採用 `Default`，讓舊版設定檔可直接升級。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GufoServerConfig {
     pub gufo_path: String,
     pub model_path: String,
@@ -24,19 +36,25 @@ pub struct GufoServerConfig {
     pub max_output_bytes: u64,
     pub think: String, // "off", "on", "auto"
     pub temperature: f32,
-    pub speculative: String, // "mtp", "dflash2", "off"
+    pub speculative: String, // "mtp", "off"
     pub mtp_policy: String,  // "survival", "length"
     pub prompt_lookup: bool,
-    #[serde(default)]
     pub api_key: String,
-    #[serde(default = "default_auto_open_gui")]
     pub auto_open_gui: bool,
-    #[serde(default)]
     pub auto_start_server: bool,
-}
-
-fn default_auto_open_gui() -> bool {
-    true
+    /// 請求未指定 max_tokens 時的預設生成上限 (0 = 沿用 Gufo 預設：直到 EOS 或 context 用盡)
+    pub max_tokens: u32,
+    /// MTP 每輪草稿 token 數 (0 = 沿用 Gufo 預設)
+    pub draft_tokens: u32,
+    /// MTP 草稿詞表："full" (預設) 或 "latin" (僅英文/程式碼輸出時較快)
+    pub mtp_draft_vocab: String,
+    /// Prefill 分塊大小 (0 = 沿用 Gufo 預設)
+    pub prefill_chunk: u32,
+    /// 啟用可跨重啟保留的磁碟前綴快取 (--cache-disk)
+    pub cache_disk: bool,
+    pub cache_disk_dir: String,
+    /// 磁碟快取容量上限 bytes (0 = 沿用 Gufo 預設)
+    pub cache_disk_bytes: u64,
 }
 
 impl Default for GufoServerConfig {
@@ -46,71 +64,39 @@ impl Default for GufoServerConfig {
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."));
+        let exists = |rel: &Path| cwd.join(rel).exists() || exe_dir.join(rel).exists();
 
         // 工作目錄下尋找 gufo.exe 的相對候選
-        let gufo_candidates = [
-            r"gufo.exe",
-            r"build\release\gufo.exe",
-            r"bin\gufo.exe",
-        ];
-
+        let gufo_candidates = [r"gufo.exe", r"build\release\gufo.exe", r"bin\gufo.exe"];
         let default_gufo = gufo_candidates
             .iter()
-            .find(|rel| cwd.join(rel).exists() || exe_dir.join(rel).exists())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                if cwd.join(r"build\release\gufo.exe").exists() || exe_dir.join(r"build\release\gufo.exe").exists() {
-                    r"build\release\gufo.exe".to_string()
-                } else {
-                    r"gufo.exe".to_string()
-                }
-            });
+            .find(|rel| exists(Path::new(rel)))
+            .unwrap_or(&gufo_candidates[0])
+            .to_string();
 
         // 工作目錄下尋找模型目錄的相對候選
-        let model_dir_candidates = [
-            r"models\Qwen3.8-Flash-Next-GGUF",
-            r"models",
-            r"",
-        ];
-
+        const MODEL_FILE: &str = "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+        let model_dir_candidates = [r"models\Qwen3.8-Flash-Next-GGUF", r"models", r""];
         let chosen_model_dir = model_dir_candidates
             .iter()
-            .find(|rel| {
-                let test_path = if rel.is_empty() {
-                    PathBuf::from("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf")
-                } else {
-                    PathBuf::from(rel).join("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf")
-                };
-                cwd.join(&test_path).exists() || exe_dir.join(&test_path).exists()
-            })
+            .find(|rel| exists(&Path::new(rel).join(MODEL_FILE)))
             .unwrap_or(&model_dir_candidates[0]);
-
-        let model_path = if chosen_model_dir.is_empty() {
-            r"Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf".to_string()
-        } else {
-            format!(r"{}\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf", chosen_model_dir)
-        };
-
-        let mtp_path = if chosen_model_dir.is_empty() {
-            r"mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf".to_string()
-        } else {
-            format!(r"{}\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf", chosen_model_dir)
-        };
-
-        let vision_path = if chosen_model_dir.is_empty() {
-            r"mmproj-BF16.gguf".to_string()
-        } else {
-            format!(r"{}\mmproj-BF16.gguf", chosen_model_dir)
+        let in_model_dir = |file: &str| {
+            if chosen_model_dir.is_empty() {
+                file.to_string()
+            } else {
+                format!(r"{}\{}", chosen_model_dir, file)
+            }
         };
 
         Self {
             gufo_path: default_gufo,
-            model_path,
-            mtp_path,
-            vision_path,
+            model_path: in_model_dir(MODEL_FILE),
+            mtp_path: in_model_dir("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"),
+            vision_path: in_model_dir("mmproj-BF16.gguf"),
             served_model_name: "flash-next".to_string(),
             host: "127.0.0.1".to_string(),
-            port: 12223, // 預設使用用戶指定的 12223 port
+            port: 12223,
             context: 131072, // 128K context
             sessions: 2,
             max_request_bytes: 67108864, // 64MB (支援多模態圖片上傳)
@@ -123,17 +109,36 @@ impl Default for GufoServerConfig {
             api_key: String::new(),
             auto_open_gui: true,
             auto_start_server: false,
+            max_tokens: 32768,
+            draft_tokens: 0,
+            mtp_draft_vocab: "full".to_string(),
+            prefill_chunk: 0,
+            cache_disk: false,
+            cache_disk_dir: "gufo-cache".to_string(),
+            cache_disk_bytes: 0,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ServerStateEnum {
+    #[default]
     Stopped,
     Starting,
     Running,
     Error,
+}
+
+impl ServerStateEnum {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Error => "error",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,29 +232,417 @@ impl InferenceMetrics {
     }
 }
 
+/// Gufo 在模型載入完成、HTTP 伺服器開始監聽後會輸出 `event=listening`。
+/// 只比對此事件，避免 "Error starting HTTP server" 之類的錯誤訊息被誤判為就緒。
+fn is_listening_line(line: &str) -> bool {
+    line.contains("event=listening")
+}
+
+/// 組裝 `gufo serve ... llm ...` 參數。純函式，方便測試。
+pub fn build_args(
+    cfg: &GufoServerConfig,
+    model: &Path,
+    mtp: Option<&Path>,
+    vision: Option<&Path>,
+    cache_dir: Option<&Path>,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    let mut push = |items: &[&str]| args.extend(items.iter().map(|s| s.to_string()));
+
+    push(&["serve", "--host", &cfg.host, "--port", &cfg.port.to_string()]);
+    push(&["--sessions", &cfg.sessions.to_string()]);
+    push(&["--max-request-bytes", &cfg.max_request_bytes.to_string()]);
+    let api_key = cfg.api_key.trim();
+    if !api_key.is_empty() {
+        push(&["--api-key", api_key]);
+    }
+
+    push(&["llm", "--model", &model.to_string_lossy()]);
+    push(&["--served-model-name", &cfg.served_model_name]);
+    push(&["--context", &cfg.context.to_string()]);
+    push(&["--max-output-bytes", &cfg.max_output_bytes.to_string()]);
+    push(&["--think", &cfg.think]);
+    push(&["--temperature", &cfg.temperature.to_string()]);
+    if cfg.max_tokens > 0 {
+        push(&["--max-tokens", &cfg.max_tokens.to_string()]);
+    }
+
+    if let Some(mtp) = mtp {
+        push(&["--speculative", "mtp", "--mtp-model", &mtp.to_string_lossy()]);
+        if !cfg.mtp_policy.is_empty() {
+            push(&["--mtp-policy", &cfg.mtp_policy]);
+        }
+        if cfg.draft_tokens > 0 {
+            push(&["--draft-tokens", &cfg.draft_tokens.to_string()]);
+        }
+        if cfg.mtp_draft_vocab == "latin" {
+            push(&["--mtp-draft-vocab", "latin"]);
+        }
+    }
+
+    if cfg.prompt_lookup {
+        push(&["--prompt-lookup"]);
+    }
+    if cfg.prefill_chunk > 0 {
+        push(&["--prefill-chunk", &cfg.prefill_chunk.to_string()]);
+    }
+    if let Some(dir) = cache_dir {
+        push(&["--cache-disk", &dir.to_string_lossy()]);
+        if cfg.cache_disk_bytes > 0 {
+            push(&["--cache-disk-bytes", &cfg.cache_disk_bytes.to_string()]);
+        }
+    }
+    if let Some(vision) = vision {
+        push(&["--mmproj", &vision.to_string_lossy()]);
+    }
+    args
+}
+
+/// 產生可安全寫入日誌的指令字串 (遮蔽 API Key)。
+pub fn redacted_command(program: &Path, args: &[String]) -> String {
+    let mut out = vec![quote_arg(&program.to_string_lossy())];
+    let mut mask_next = false;
+    for arg in args {
+        if mask_next {
+            out.push("******".to_string());
+            mask_next = false;
+        } else {
+            mask_next = arg == "--api-key";
+            out.push(quote_arg(arg));
+        }
+    }
+    out.join(" ")
+}
+
+fn quote_arg(arg: &str) -> String {
+    if arg.contains(' ') {
+        format!("\"{}\"", arg)
+    } else {
+        arg.to_string()
+    }
+}
+
+#[derive(Default)]
+struct Runtime {
+    state: ServerStateEnum,
+    child: Option<Child>,
+    adopted: bool,
+    start_time: Option<Instant>,
+    error_message: Option<String>,
+}
+
+impl Runtime {
+    /// 子程序結束時更新狀態，回傳 (新狀態, 日誌訊息)；若是預期中的停止則回傳 None。
+    fn on_child_exited(&mut self, status: ExitStatus) -> Option<(ServerStateEnum, String)> {
+        self.child = None;
+        self.start_time = None;
+        self.adopted = false;
+        match self.state {
+            ServerStateEnum::Starting => {
+                let msg = format!(
+                    "Gufo 推理伺服器在啟動階段意外中止 ({})。請查看上方日誌，常見原因：模型路徑錯誤、記憶體不足或 Context × Sessions 過大。",
+                    status
+                );
+                self.state = ServerStateEnum::Error;
+                self.error_message = Some(msg.clone());
+                Some((ServerStateEnum::Error, format!("[錯誤] {}", msg)))
+            }
+            ServerStateEnum::Running => {
+                self.state = ServerStateEnum::Stopped;
+                Some((
+                    ServerStateEnum::Stopped,
+                    format!(
+                        "[系統] ⚠️ 偵測到 Gufo 推理伺服器已意外中止 ({})，狀態已自動重置為已停止。",
+                        status
+                    ),
+                ))
+            }
+            _ => None,
+        }
+    }
+}
+
+struct Shared {
+    runtime: Mutex<Runtime>,
+    config: Mutex<GufoServerConfig>,
+    logs: Mutex<VecDeque<String>>,
+    metrics: Mutex<VecDeque<InferenceMetrics>>,
+    /// 每次啟動/接管/停止都會遞增；舊的監控與讀取任務發現不相符時即自行結束。
+    generation: AtomicU64,
+    /// 序列化 start/stop，避免托盤與 UI 同時操作造成重複啟動。
+    op_lock: Mutex<()>,
+}
+
+impl Shared {
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// 必須在持有 runtime 鎖時呼叫，確保世代與狀態變更一致。
+    fn next_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    async fn log(&self, app: Option<&AppHandle>, line: impl Into<String>) {
+        let line = line.into();
+        {
+            let mut logs = self.logs.lock().await;
+            if logs.len() >= MAX_LOG_LINES {
+                logs.pop_front();
+            }
+            logs.push_back(line.clone());
+        }
+        if let Some(app) = app {
+            let _ = app.emit("gufo-log", line);
+        }
+    }
+
+    async fn push_metrics(&self, app: Option<&AppHandle>, metrics: InferenceMetrics) {
+        {
+            let mut m = self.metrics.lock().await;
+            if m.len() >= MAX_METRICS {
+                m.pop_front();
+            }
+            m.push_back(metrics.clone());
+        }
+        if let Some(app) = app {
+            let _ = app.emit("gufo-metrics", metrics);
+        }
+    }
+
+    /// 若仍屬於同一世代且處於 Starting，轉為 Running 並回傳載入耗時。
+    async fn mark_running_if_starting(&self, generation: u64, app: Option<&AppHandle>, port: u16) -> Option<Duration> {
+        let elapsed = {
+            let mut rt = self.runtime.lock().await;
+            if self.current_generation() != generation || rt.state != ServerStateEnum::Starting {
+                return None;
+            }
+            rt.state = ServerStateEnum::Running;
+            rt.start_time.get_or_insert_with(Instant::now).elapsed()
+        };
+        notify_state(app, &ServerStateEnum::Running, port);
+        self.log(
+            app,
+            format!("[系統] ✅ Gufo 推理伺服器已就緒 (模型載入耗時 {:.1} 秒)。", elapsed.as_secs_f64()),
+        )
+        .await;
+        Some(elapsed)
+    }
+}
+
+fn notify_state(app: Option<&AppHandle>, state: &ServerStateEnum, port: u16) {
+    if let Some(app) = app {
+        crate::tray::update_tray_status(app, state, port);
+        let _ = app.emit("gufo-status-changed", state.as_str());
+    }
+}
+
+fn http_client(timeout_ms: u64) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+        .unwrap_or_default()
+}
+
+async fn probe_status(client: &reqwest::Client, url: &str, api_key: &str) -> Option<reqwest::StatusCode> {
+    let mut req = client.get(url);
+    if !api_key.is_empty() {
+        req = req.bearer_auth(api_key);
+    }
+    req.send().await.ok().map(|r| r.status())
+}
+
+/// 以 `/ready` 判斷模型是否可接受推論 (載入中回 503)；舊版 Gufo 無此端點時退回 `/health`。
+async fn probe_ready(client: &reqwest::Client, host: &str, port: u16, api_key: &str) -> bool {
+    let base = format!("http://{}:{}", host, port);
+    match probe_status(client, &format!("{}/ready", base), api_key).await {
+        Some(s) if s.is_success() => true,
+        Some(reqwest::StatusCode::NOT_FOUND) => {
+            matches!(probe_status(client, &format!("{}/health", base), api_key).await, Some(s) if s.is_success())
+        }
+        _ => false,
+    }
+}
+
+async fn port_open(host: &str, port: u16, timeout: Duration) -> bool {
+    tokio::time::timeout(timeout, tokio::net::TcpStream::connect((host, port)))
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+}
+
+/// 逐行讀取子程序輸出。使用 lossy 解碼，避免非 UTF-8 輸出 (例如系統錯誤訊息)
+/// 讓讀取中斷進而塞滿管線、卡住 Gufo。
+fn spawn_output_reader<R>(shared: Arc<Shared>, app: AppHandle, generation: u64, port: u16, stream: R)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stream);
+        let mut buf = Vec::with_capacity(512);
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let line = String::from_utf8_lossy(&buf)
+                .trim_end_matches(['\r', '\n'])
+                .to_string();
+            if let Some(metrics) = InferenceMetrics::parse_log_line(&line) {
+                shared.push_metrics(Some(&app), metrics).await;
+            }
+            let ready = is_listening_line(&line);
+            shared.log(Some(&app), line).await;
+            if ready {
+                shared.mark_running_if_starting(generation, Some(&app), port).await;
+            }
+        }
+    });
+}
+
+/// 生命週期監控：啟動階段等待 `/ready`，運行階段偵測子程序崩潰或外部伺服器中止。
+fn spawn_lifecycle_monitor(shared: Arc<Shared>, app: AppHandle, generation: u64, host: String, port: u16, api_key: String) {
+    tokio::spawn(async move {
+        let client = http_client(1500);
+        let started = Instant::now();
+        let mut hinted = false;
+
+        // 第一階段：等待模型載入完成 (不設硬性逾時；Windows carve-out 不足時載入可能需數分鐘)
+        loop {
+            if shared.current_generation() != generation {
+                return;
+            }
+            {
+                let mut rt = shared.runtime.lock().await;
+                if rt.state != ServerStateEnum::Starting {
+                    break;
+                }
+                if let Some(child) = rt.child.as_mut() {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        let transition = rt.on_child_exited(status);
+                        drop(rt);
+                        if let Some((state, msg)) = transition {
+                            shared.log(Some(&app), msg).await;
+                            notify_state(Some(&app), &state, port);
+                        }
+                        return;
+                    }
+                } else if !rt.adopted {
+                    return;
+                }
+            }
+
+            if probe_ready(&client, &host, port, &api_key).await {
+                shared.mark_running_if_starting(generation, Some(&app), port).await;
+                break;
+            }
+            if !hinted && started.elapsed() > SLOW_LOAD_HINT_AFTER {
+                hinted = true;
+                shared
+                    .log(
+                        Some(&app),
+                        "[系統] 模型仍在載入中…若 BIOS 的 iGPU 記憶體配置 (UMA carve-out) 低於 96GB，Windows 上載入可能需要數分鐘，且解碼速度會下降。",
+                    )
+                    .await;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // 第二階段：持續監控
+        let mut adopted_failures = 0u32;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if shared.current_generation() != generation {
+                return;
+            }
+            let mut rt = shared.runtime.lock().await;
+            if rt.state != ServerStateEnum::Running {
+                return;
+            }
+            if let Some(child) = rt.child.as_mut() {
+                if let Ok(Some(status)) = child.try_wait() {
+                    let transition = rt.on_child_exited(status);
+                    drop(rt);
+                    if let Some((state, msg)) = transition {
+                        shared.log(Some(&app), msg).await;
+                        notify_state(Some(&app), &state, port);
+                    }
+                    return;
+                }
+                continue;
+            }
+            if !rt.adopted {
+                return;
+            }
+            drop(rt);
+
+            if port_open(&host, port, Duration::from_millis(500)).await {
+                adopted_failures = 0;
+                continue;
+            }
+            adopted_failures += 1;
+            if adopted_failures < 2 {
+                continue;
+            }
+            let mut rt = shared.runtime.lock().await;
+            if shared.current_generation() != generation || rt.state != ServerStateEnum::Running || !rt.adopted {
+                return;
+            }
+            rt.state = ServerStateEnum::Stopped;
+            rt.adopted = false;
+            rt.start_time = None;
+            drop(rt);
+            shared
+                .log(Some(&app), "[系統] ⚠️ 偵測到外部 Gufo 推理伺服器已中止，狀態已自動重置為已停止。")
+                .await;
+            notify_state(Some(&app), &ServerStateEnum::Stopped, port);
+            return;
+        }
+    });
+}
+
+/// 先送出 Ctrl+C 讓 Gufo 正常關閉，逾時才強制終止。
+async fn shutdown_child(mut child: Child) -> String {
+    if let Ok(Some(status)) = child.try_wait() {
+        return format!("[系統] Gufo 子程序已結束 ({})。", status);
+    }
+    if let Some(pid) = child.id() {
+        let sent = tokio::task::spawn_blocking(move || process_control::request_graceful_stop(pid))
+            .await
+            .unwrap_or(false);
+        if sent {
+            if let Ok(Ok(status)) = tokio::time::timeout(GRACEFUL_STOP_TIMEOUT, child.wait()).await {
+                return format!("[系統] Gufo 已正常關閉 ({})，GPU 記憶體已釋放。", status);
+            }
+        }
+    }
+    let _ = child.kill().await;
+    "[系統] Gufo 未在時限內正常結束，已強制終止子程序，GPU 記憶體已釋放。".to_string()
+}
+
 pub struct GufoManager {
-    child: Arc<Mutex<Option<Child>>>,
-    is_adopted: Arc<Mutex<bool>>,
-    config: Arc<Mutex<GufoServerConfig>>,
-    state: Arc<Mutex<ServerStateEnum>>,
-    start_time: Arc<Mutex<Option<Instant>>>,
-    error_message: Arc<Mutex<Option<String>>>,
-    recent_logs: Arc<Mutex<VecDeque<String>>>,
-    recent_metrics: Arc<Mutex<VecDeque<InferenceMetrics>>>,
+    shared: Arc<Shared>,
+}
+
+impl Default for GufoManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GufoManager {
     pub fn new() -> Self {
         let initial_config = Self::load_saved_config().unwrap_or_default();
         Self {
-            child: Arc::new(Mutex::new(None)),
-            is_adopted: Arc::new(Mutex::new(false)),
-            config: Arc::new(Mutex::new(initial_config)),
-            state: Arc::new(Mutex::new(ServerStateEnum::Stopped)),
-            start_time: Arc::new(Mutex::new(None)),
-            error_message: Arc::new(Mutex::new(None)),
-            recent_logs: Arc::new(Mutex::new(VecDeque::with_capacity(1000))),
-            recent_metrics: Arc::new(Mutex::new(VecDeque::with_capacity(50))),
+            shared: Arc::new(Shared {
+                runtime: Mutex::new(Runtime::default()),
+                config: Mutex::new(initial_config),
+                logs: Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES)),
+                metrics: Mutex::new(VecDeque::with_capacity(MAX_METRICS)),
+                generation: AtomicU64::new(0),
+                op_lock: Mutex::new(()),
+            }),
         }
     }
 
@@ -261,26 +654,19 @@ impl GufoManager {
         exe_dir.join("gufo-studio.config.json")
     }
 
-    pub fn load_saved_config() -> Option<GufoServerConfig> {
-        let path = Self::get_config_file_path();
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(cfg) = serde_json::from_str::<GufoServerConfig>(&content) {
-                    return Some(cfg);
-                }
-            }
-        }
-        None
+    pub fn has_saved_config() -> bool {
+        Self::get_config_file_path().exists()
     }
 
-    pub async fn save_config(
-        &self,
-        app: Option<&AppHandle>,
-        cfg: GufoServerConfig,
-    ) -> Result<(), String> {
-        *self.config.lock().await = cfg.clone();
+    pub fn load_saved_config() -> Option<GufoServerConfig> {
+        let content = std::fs::read_to_string(Self::get_config_file_path()).ok()?;
+        serde_json::from_str::<GufoServerConfig>(&content).ok()
+    }
+
+    pub async fn save_config(&self, app: Option<&AppHandle>, cfg: GufoServerConfig) -> Result<(), String> {
+        *self.shared.config.lock().await = cfg.clone();
         if let Some(app_handle) = app {
-            let current_state = self.state.lock().await.clone();
+            let current_state = self.shared.runtime.lock().await.state.clone();
             crate::tray::update_tray_status(app_handle, &current_state, cfg.port);
         }
         let path = Self::get_config_file_path();
@@ -290,539 +676,215 @@ impl GufoManager {
     }
 
     pub async fn get_config(&self) -> GufoServerConfig {
-        self.config.lock().await.clone()
+        self.shared.config.lock().await.clone()
     }
 
     pub async fn get_status(&self, app: Option<&AppHandle>) -> ServerStatus {
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.shared.config.lock().await.clone();
 
-        // 主動檢查子進程是否已經意外終止
-        let mut unexpected_exit: Option<String> = None;
-        {
-            let mut child_guard = self.child.lock().await;
-            if let Some(ref mut child) = *child_guard {
-                if let Ok(Some(exit_status)) = child.try_wait() {
-                    *child_guard = None;
-                    unexpected_exit = Some(exit_status.to_string());
-                }
-            }
-        }
-
-        if let Some(exit_str) = unexpected_exit {
-            let mut st = self.state.lock().await;
-            if *st != ServerStateEnum::Stopped {
-                *st = ServerStateEnum::Stopped;
-                drop(st);
-                *self.start_time.lock().await = None;
-                *self.is_adopted.lock().await = false;
-                let log_msg = format!(
-                    "[系統] ⚠️ 偵測到 Gufo 推理伺服器已意外中止 ({})，狀態已自動重置為已停止。",
-                    exit_str
-                );
-                self.add_log(log_msg.clone()).await;
-                if let Some(app_handle) = app {
-                    let _ = app_handle.emit("gufo-log", log_msg);
-                    crate::tray::update_tray_status(app_handle, &ServerStateEnum::Stopped, cfg.port);
-                    let _ = app_handle.emit("gufo-status-changed", "stopped");
-                }
-            }
-        } else {
-            let is_adopted = *self.is_adopted.lock().await;
-            let current_state = self.state.lock().await.clone();
-            if is_adopted && current_state == ServerStateEnum::Running {
-                let port_alive = tokio::time::timeout(
-                    std::time::Duration::from_millis(300),
-                    tokio::net::TcpStream::connect((cfg.host.as_str(), cfg.port)),
-                )
-                .await
-                .map(|r| r.is_ok())
-                .unwrap_or(false);
-
-                if !port_alive {
-                    *self.is_adopted.lock().await = false;
-                    *self.state.lock().await = ServerStateEnum::Stopped;
-                    *self.start_time.lock().await = None;
-                    let log_msg =
-                        "[系統] ⚠️ 偵測到外部 Gufo 推理伺服器已中止，狀態已自動重置為已停止。"
-                            .to_string();
-                    self.add_log(log_msg.clone()).await;
-                    if let Some(app_handle) = app {
-                        let _ = app_handle.emit("gufo-log", log_msg);
-                        crate::tray::update_tray_status(
-                            app_handle,
-                            &ServerStateEnum::Stopped,
-                            cfg.port,
-                        );
-                        let _ = app_handle.emit("gufo-status-changed", "stopped");
-                    }
-                }
-            }
-        }
-
-        let state = self.state.lock().await.clone();
-        let pid = {
-            let child_guard = self.child.lock().await;
-            child_guard.as_ref().and_then(|c| c.id())
+        let (status, transition) = {
+            let mut rt = self.shared.runtime.lock().await;
+            // 主動檢查子程序是否已意外終止 (監控任務也會偵測，此處讓輪詢立即反映)
+            let exited = rt.child.as_mut().and_then(|c| c.try_wait().ok().flatten());
+            let transition = exited.and_then(|status| rt.on_child_exited(status));
+            let uptime = match (&rt.state, rt.start_time) {
+                (ServerStateEnum::Running, Some(t)) => t.elapsed().as_secs(),
+                _ => 0,
+            };
+            let status = ServerStatus {
+                state: rt.state.clone(),
+                pid: rt.child.as_ref().and_then(|c| c.id()),
+                port: cfg.port,
+                host: cfg.host.clone(),
+                served_model_name: cfg.served_model_name.clone(),
+                endpoint: format!("http://{}:{}/v1", cfg.host, cfg.port),
+                uptime_secs: uptime,
+                error_message: rt.error_message.clone(),
+                api_key: Some(cfg.api_key.trim().to_string()).filter(|k| !k.is_empty()),
+            };
+            (status, transition)
         };
-        let uptime = if state == ServerStateEnum::Running {
-            self.start_time
-                .lock()
-                .await
-                .map(|t| t.elapsed().as_secs())
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let err = self.error_message.lock().await.clone();
 
-        ServerStatus {
-            state,
-            pid,
-            port: cfg.port,
-            host: cfg.host.clone(),
-            served_model_name: cfg.served_model_name.clone(),
-            endpoint: format!("http://{}:{}/v1", cfg.host, cfg.port),
-            uptime_secs: uptime,
-            error_message: err,
-            api_key: if cfg.api_key.trim().is_empty() {
-                None
-            } else {
-                Some(cfg.api_key.trim().to_string())
-            },
+        if let Some((state, msg)) = transition {
+            self.shared.log(app, msg).await;
+            notify_state(app, &state, cfg.port);
         }
+        status
     }
 
     pub async fn get_logs(&self) -> Vec<String> {
-        self.recent_logs.lock().await.iter().cloned().collect()
+        self.shared.logs.lock().await.iter().cloned().collect()
     }
 
     pub async fn get_metrics(&self) -> Vec<InferenceMetrics> {
-        self.recent_metrics.lock().await.iter().cloned().collect()
+        self.shared.metrics.lock().await.iter().cloned().collect()
     }
 
     pub fn resolve_path(path_str: &str) -> PathBuf {
-        let p = std::path::Path::new(path_str);
-        if p.is_absolute() && p.exists() {
+        let p = Path::new(path_str);
+        if p.is_absolute() {
             return p.to_path_buf();
         }
-        if let Ok(cwd) = std::env::current_dir() {
-            let candidate = cwd.join(p);
+        let cwd = std::env::current_dir().ok();
+        let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
+        for base in [&cwd, &exe_dir].into_iter().flatten() {
+            let candidate = base.join(p);
             if candidate.exists() {
                 return candidate;
             }
         }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                let candidate = parent.join(p);
-                if candidate.exists() {
-                    return candidate;
-                }
-            }
-        }
-        if let Ok(cwd) = std::env::current_dir() {
-            if p.is_relative() {
-                return cwd.join(p);
-            }
-        }
-        p.to_path_buf()
+        cwd.map(|c| c.join(p)).unwrap_or_else(|| p.to_path_buf())
+    }
+
+    /// 將指定 Port 上已就緒的 Gufo 伺服器標記為「已接管」並開始監控。
+    async fn adopt_running_server(&self, app: AppHandle, cfg: &GufoServerConfig, message: String) {
+        let generation = {
+            let mut rt = self.shared.runtime.lock().await;
+            let generation = self.shared.next_generation();
+            rt.state = ServerStateEnum::Running;
+            rt.adopted = true;
+            rt.start_time = Some(Instant::now());
+            rt.error_message = None;
+            generation
+        };
+        self.shared.log(Some(&app), message).await;
+        notify_state(Some(&app), &ServerStateEnum::Running, cfg.port);
+        spawn_lifecycle_monitor(
+            self.shared.clone(),
+            app,
+            generation,
+            cfg.host.clone(),
+            cfg.port,
+            cfg.api_key.trim().to_string(),
+        );
     }
 
     pub async fn sync_existing_server_on_startup(&self, app: AppHandle) {
-        if self.check_health().await {
-            let cfg = self.config.lock().await.clone();
-            let mut st = self.state.lock().await;
-            if *st == ServerStateEnum::Stopped {
-                *st = ServerStateEnum::Running;
-                drop(st);
-                *self.is_adopted.lock().await = true;
-                *self.start_time.lock().await = Some(Instant::now());
-                *self.error_message.lock().await = None;
-
-                let log_msg = format!(
-                    "[系統] 偵測到 Port {} 已有運行的 Gufo 伺服器，已自動同步運行狀態。",
-                    cfg.port
-                );
-                self.add_log(log_msg.clone()).await;
-                let _ = app.emit("gufo-log", log_msg);
-                crate::tray::update_tray_status(&app, &ServerStateEnum::Running, cfg.port);
-                let _ = app.emit("gufo-status-changed", "running");
-
-                self.spawn_lifecycle_monitor(
-                    app,
-                    cfg.host.clone(),
-                    cfg.port,
-                    cfg.api_key.trim().to_string(),
-                );
-            }
+        let _op = self.shared.op_lock.lock().await;
+        let cfg = self.get_config().await;
+        if self.shared.runtime.lock().await.state != ServerStateEnum::Stopped {
+            return;
+        }
+        if probe_ready(&http_client(800), &cfg.host, cfg.port, cfg.api_key.trim()).await {
+            let msg = format!("[系統] 偵測到 Port {} 已有運行的 Gufo 伺服器，已自動同步運行狀態。", cfg.port);
+            self.adopt_running_server(app, &cfg, msg).await;
         }
     }
 
-    fn spawn_lifecycle_monitor(
-        &self,
-        app: AppHandle,
-        host: String,
-        port: u16,
-        api_key: String,
-    ) {
-        let state_clone = self.state.clone();
-        let child_clone = self.child.clone();
-        let is_adopted_clone = self.is_adopted.clone();
-        let start_time_clone = self.start_time.clone();
-        let error_msg_clone = self.error_message.clone();
-        let logs_clone = self.recent_logs.clone();
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(800))
-            .build()
-            .unwrap_or_default();
-        let health_url = format!("http://{}:{}/health", host, port);
-
-        tokio::spawn(async move {
-            // 第一階段：若處於 Starting，每 500ms 探測一次健康狀態，最多嘗試 240 次 (約 2 分鐘)
-            for _ in 0..240 {
-                {
-                    let st = state_clone.lock().await;
-                    if *st == ServerStateEnum::Running {
-                        break;
-                    }
-                    if *st == ServerStateEnum::Stopped || *st == ServerStateEnum::Error {
-                        return;
-                    }
-                }
-
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-                {
-                    let st = state_clone.lock().await;
-                    if *st == ServerStateEnum::Running {
-                        break;
-                    }
-                    if *st == ServerStateEnum::Stopped || *st == ServerStateEnum::Error {
-                        return;
-                    }
-                }
-
-                // 檢查進程是否在啟動期間意外退出
-                {
-                    let mut child_guard = child_clone.lock().await;
-                    if let Some(ref mut child) = *child_guard {
-                        if let Ok(Some(exit_status)) = child.try_wait() {
-                            *child_guard = None;
-                            drop(child_guard);
-                            *start_time_clone.lock().await = None;
-                            let err_msg = format!("Gufo 推理伺服器在啟動階段意外中止 ({})", exit_status);
-                            *error_msg_clone.lock().await = Some(err_msg.clone());
-                            *state_clone.lock().await = ServerStateEnum::Error;
-                            let log_line = format!("[錯誤] {}", err_msg);
-                            {
-                                let mut logs = logs_clone.lock().await;
-                                if logs.len() >= 1000 {
-                                    logs.pop_front();
-                                }
-                                logs.push_back(log_line.clone());
-                            }
-                            let _ = app.emit("gufo-log", log_line);
-                            crate::tray::update_tray_status(&app, &ServerStateEnum::Error, port);
-                            let _ = app.emit("gufo-status-changed", "error");
-                            return;
-                        }
-                    } else if !*is_adopted_clone.lock().await {
-                        return;
-                    }
-                }
-
-                // HTTP GET /health 探測
-                let mut req = client.get(&health_url);
-                if !api_key.is_empty() {
-                    req = req.bearer_auth(&api_key);
-                }
-
-                if let Ok(resp) = req.send().await {
-                    if resp.status().is_success() {
-                        let mut st = state_clone.lock().await;
-                        if *st == ServerStateEnum::Starting {
-                            *st = ServerStateEnum::Running;
-                            drop(st);
-                            crate::tray::update_tray_status(&app, &ServerStateEnum::Running, port);
-                            let _ = app.emit("gufo-status-changed", "running");
-                        }
-                        break;
-                    }
-                }
-            }
-
-            // 若超過嘗試時間仍處於 Starting，檢查進程是否仍在運行
-            {
-                let mut st = state_clone.lock().await;
-                if *st == ServerStateEnum::Starting {
-                    let mut child_guard = child_clone.lock().await;
-                    if let Some(ref mut child) = *child_guard {
-                        if let Ok(None) = child.try_wait() {
-                            *st = ServerStateEnum::Running;
-                            drop(child_guard);
-                            drop(st);
-                            crate::tray::update_tray_status(&app, &ServerStateEnum::Running, port);
-                            let _ = app.emit("gufo-status-changed", "running");
-                        } else {
-                            *child_guard = None;
-                            drop(child_guard);
-                            *st = ServerStateEnum::Error;
-                            drop(st);
-                            *start_time_clone.lock().await = None;
-                            crate::tray::update_tray_status(&app, &ServerStateEnum::Error, port);
-                            let _ = app.emit("gufo-status-changed", "error");
-                            return;
-                        }
-                    } else {
-                        return;
-                    }
-                }
-            }
-
-            // 第二階段：持續監控運行中的伺服器，偵測意外崩潰或被外部終止
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-
-                {
-                    let st = state_clone.lock().await;
-                    if *st != ServerStateEnum::Running {
-                        return;
-                    }
-                }
-
-                let mut child_guard = child_clone.lock().await;
-                if let Some(ref mut child) = *child_guard {
-                    if let Ok(Some(exit_status)) = child.try_wait() {
-                        *child_guard = None;
-                        drop(child_guard);
-
-                        let mut st = state_clone.lock().await;
-                        if *st != ServerStateEnum::Stopped {
-                            *st = ServerStateEnum::Stopped;
-                            drop(st);
-                            *start_time_clone.lock().await = None;
-                            *is_adopted_clone.lock().await = false;
-
-                            let log_msg = format!(
-                                "[系統] ⚠️ 偵測到 Gufo 推理伺服器已意外中止 ({})，狀態已自動重置為已停止。",
-                                exit_status
-                            );
-                            {
-                                let mut logs = logs_clone.lock().await;
-                                if logs.len() >= 1000 {
-                                    logs.pop_front();
-                                }
-                                logs.push_back(log_msg.clone());
-                            }
-                            let _ = app.emit("gufo-log", log_msg);
-                            crate::tray::update_tray_status(&app, &ServerStateEnum::Stopped, port);
-                            let _ = app.emit("gufo-status-changed", "stopped");
-                        }
-                        return;
-                    }
-                } else {
-                    drop(child_guard);
-                    if *is_adopted_clone.lock().await {
-                        let port_alive = tokio::time::timeout(
-                            std::time::Duration::from_millis(500),
-                            tokio::net::TcpStream::connect((host.as_str(), port)),
-                        )
-                        .await
-                        .map(|r| r.is_ok())
-                        .unwrap_or(false);
-
-                        if !port_alive {
-                            *is_adopted_clone.lock().await = false;
-                            let mut st = state_clone.lock().await;
-                            if *st != ServerStateEnum::Stopped {
-                                *st = ServerStateEnum::Stopped;
-                                drop(st);
-                                *start_time_clone.lock().await = None;
-
-                                let log_msg =
-                                    "[系統] ⚠️ 偵測到外部 Gufo 推理伺服器已中止，狀態已自動重置為已停止。"
-                                        .to_string();
-                                {
-                                    let mut logs = logs_clone.lock().await;
-                                    if logs.len() >= 1000 {
-                                        logs.pop_front();
-                                    }
-                                    logs.push_back(log_msg.clone());
-                                }
-                                let _ = app.emit("gufo-log", log_msg);
-                                crate::tray::update_tray_status(
-                                    &app,
-                                    &ServerStateEnum::Stopped,
-                                    port,
-                                );
-                                let _ = app.emit("gufo-status-changed", "stopped");
-                            }
-                            return;
-                        }
-                    } else {
-                        return;
-                    }
-                }
-            }
-        });
+    async fn fail(&self, app: &AppHandle, port: u16, msg: String) -> Result<ServerStatus, String> {
+        {
+            let mut rt = self.shared.runtime.lock().await;
+            self.shared.next_generation();
+            rt.state = ServerStateEnum::Error;
+            rt.error_message = Some(msg.clone());
+            rt.start_time = None;
+        }
+        self.shared.log(Some(app), format!("[錯誤] {}", msg)).await;
+        notify_state(Some(app), &ServerStateEnum::Error, port);
+        Err(msg)
     }
 
     pub async fn start(&self, app: AppHandle, new_config: Option<GufoServerConfig>) -> Result<ServerStatus, String> {
-        // 先檢查伺服器是否已在運行中（若子進程已意外退出則先清理）
+        let _op = self.shared.op_lock.lock().await;
         {
-            let mut child_guard = self.child.lock().await;
-            if let Some(ref mut child) = *child_guard {
-                if let Ok(Some(_)) = child.try_wait() {
-                    *child_guard = None;
-                } else {
-                    return Err("伺服器已在運行中".to_string());
+            let mut rt = self.shared.runtime.lock().await;
+            if let Some(child) = rt.child.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(_)) => rt.child = None,
+                    _ => return Err("伺服器已在運行中".to_string()),
                 }
             }
         }
 
         if let Some(cfg) = new_config {
-            *self.config.lock().await = cfg;
+            *self.shared.config.lock().await = cfg;
         }
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.get_config().await;
+        let port = cfg.port;
+        let api_key = cfg.api_key.trim().to_string();
 
-        // 啟動前檢查：目標 host:port 是否已有活著的 Gufo 伺服器（例如先前實例啟動）
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(600))
-            .build()
-            .unwrap_or_default();
-        let health_url = format!("http://{}:{}/health", cfg.host, cfg.port);
-        let mut req = client.get(&health_url);
-        if !cfg.api_key.trim().is_empty() {
-            req = req.bearer_auth(cfg.api_key.trim());
-        }
-
-        if let Ok(resp) = req.send().await {
-            if resp.status().is_success() {
-                self.add_log(format!(
-                    "[系統] 偵測到 Port {} 已有運行的 Gufo 伺服器，已自動接管該服務，避免重複啟動耗損顯存。",
-                    cfg.port
-                ))
-                .await;
-                *self.state.lock().await = ServerStateEnum::Running;
-                *self.is_adopted.lock().await = true;
-                *self.start_time.lock().await = Some(Instant::now());
-                *self.error_message.lock().await = None;
-                crate::tray::update_tray_status(&app, &ServerStateEnum::Running, cfg.port);
-                let _ = app.emit("gufo-status-changed", "running");
-
-                self.spawn_lifecycle_monitor(
-                    app.clone(),
-                    cfg.host.clone(),
-                    cfg.port,
-                    cfg.api_key.trim().to_string(),
-                );
-                return Ok(self.get_status(Some(&app)).await);
-            }
-        }
-
-        // 若不是合法的 Gufo 伺服器但該 Port 已被佔用，提早阻擋避免衝突
-        if tokio::net::TcpStream::connect((cfg.host.as_str(), cfg.port)).await.is_ok() {
-            let err_msg = format!(
-                "Port {} 目前已被佔用但無法通過健康檢查，請確認是否有異常殘留程序或更換 Port",
-                cfg.port
+        // 目標 Port 已有就緒的 Gufo 伺服器 (例如先前實例啟動) → 直接接管，避免重複佔用記憶體
+        if probe_ready(&http_client(800), &cfg.host, port, &api_key).await {
+            let msg = format!(
+                "[系統] 偵測到 Port {} 已有運行的 Gufo 伺服器，已自動接管該服務，避免重複啟動耗損顯存。",
+                port
             );
-            self.add_log(format!("[錯誤] {}", err_msg)).await;
-            *self.state.lock().await = ServerStateEnum::Error;
-            *self.error_message.lock().await = Some(err_msg.clone());
-            crate::tray::update_tray_status(&app, &ServerStateEnum::Error, cfg.port);
-            let _ = app.emit("gufo-status-changed", "error");
-            return Err(err_msg);
+            self.adopt_running_server(app.clone(), &cfg, msg).await;
+            return Ok(self.get_status(Some(&app)).await);
+        }
+
+        if port_open(&cfg.host, port, Duration::from_millis(500)).await {
+            let msg = format!(
+                "Port {} 已被佔用但尚未通過就緒檢查（可能是仍在載入模型的 Gufo，或其他程式）。請稍候再試或更換 Port。",
+                port
+            );
+            return self.fail(&app, port, msg).await;
         }
 
         let resolved_gufo = Self::resolve_path(&cfg.gufo_path);
-        let resolved_model = Self::resolve_path(&cfg.model_path);
-
-        // 檢查執行檔是否存在
         if !resolved_gufo.exists() {
-            let msg = format!("找不到 Gufo 主程式檔案：{}", cfg.gufo_path);
-            *self.state.lock().await = ServerStateEnum::Error;
-            *self.error_message.lock().await = Some(msg.clone());
-            crate::tray::update_tray_status(&app, &ServerStateEnum::Error, cfg.port);
-            let _ = app.emit("gufo-status-changed", "error");
-            return Err(msg);
+            return self.fail(&app, port, format!("找不到 Gufo 主程式檔案：{}", cfg.gufo_path)).await;
         }
-
-        // 檢查模型檔案是否存在
+        let resolved_model = Self::resolve_path(&cfg.model_path);
         if !resolved_model.exists() {
-            let msg = format!("找不到模型主檔：{}", cfg.model_path);
-            *self.state.lock().await = ServerStateEnum::Error;
-            *self.error_message.lock().await = Some(msg.clone());
-            crate::tray::update_tray_status(&app, &ServerStateEnum::Error, cfg.port);
-            let _ = app.emit("gufo-status-changed", "error");
-            return Err(msg);
+            return self.fail(&app, port, format!("找不到模型主檔：{}", cfg.model_path)).await;
         }
 
-        *self.state.lock().await = ServerStateEnum::Starting;
-        *self.is_adopted.lock().await = false;
-        *self.error_message.lock().await = None;
-        *self.start_time.lock().await = None;
-        crate::tray::update_tray_status(&app, &ServerStateEnum::Starting, cfg.port);
-        let _ = app.emit("gufo-status-changed", "starting");
-
-        // 組裝指令參數
-        let mut args: Vec<String> = vec![
-            "serve".to_string(),
-            "--host".to_string(),
-            cfg.host.clone(),
-            "--port".to_string(),
-            cfg.port.to_string(),
-            "--sessions".to_string(),
-            cfg.sessions.to_string(),
-            "--max-request-bytes".to_string(),
-            cfg.max_request_bytes.to_string(),
-            "llm".to_string(),
-            "--model".to_string(),
-            resolved_model.to_string_lossy().to_string(),
-            "--served-model-name".to_string(),
-            cfg.served_model_name.clone(),
-            "--context".to_string(),
-            cfg.context.to_string(),
-            "--max-output-bytes".to_string(),
-            cfg.max_output_bytes.to_string(),
-            "--think".to_string(),
-            cfg.think.clone(),
-            "--temperature".to_string(),
-            cfg.temperature.to_string(),
-        ];
-
-        if !cfg.api_key.trim().is_empty() {
-            args.push("--api-key".to_string());
-            args.push(cfg.api_key.trim().to_string());
-        }
-
-        if cfg.speculative == "mtp" && !cfg.mtp_path.is_empty() {
-            let resolved_mtp = Self::resolve_path(&cfg.mtp_path);
-            if resolved_mtp.exists() {
-                args.push("--speculative".to_string());
-                args.push("mtp".to_string());
-                args.push("--mtp-model".to_string());
-                args.push(resolved_mtp.to_string_lossy().to_string());
-                if !cfg.mtp_policy.is_empty() {
-                    args.push("--mtp-policy".to_string());
-                    args.push(cfg.mtp_policy.clone());
-                }
+        let mut warnings = Vec::new();
+        let mtp = if cfg.speculative == "mtp" && !cfg.mtp_path.trim().is_empty() {
+            let p = Self::resolve_path(&cfg.mtp_path);
+            if p.exists() {
+                Some(p)
+            } else {
+                warnings.push(format!(
+                    "[警告] 找不到 MTP 模型 {}，本次將不使用投機解碼（生成速度會明顯下降）。",
+                    cfg.mtp_path
+                ));
+                None
             }
-        }
-
-        if cfg.prompt_lookup {
-            args.push("--prompt-lookup".to_string());
-        }
-
-        if !cfg.vision_path.is_empty() {
-            let resolved_vision = Self::resolve_path(&cfg.vision_path);
-            if resolved_vision.exists() {
-                args.push("--mmproj".to_string());
-                args.push(resolved_vision.to_string_lossy().to_string());
+        } else {
+            None
+        };
+        let vision = if !cfg.vision_path.trim().is_empty() {
+            let p = Self::resolve_path(&cfg.vision_path);
+            if p.exists() {
+                Some(p)
+            } else {
+                warnings.push(format!("[警告] 找不到視覺模型 {}，本次將不啟用圖片輸入。", cfg.vision_path));
+                None
             }
+        } else {
+            None
+        };
+        let cache_dir = if cfg.cache_disk {
+            let dir_str = if cfg.cache_disk_dir.trim().is_empty() { "gufo-cache" } else { cfg.cache_disk_dir.trim() };
+            let dir = Self::resolve_path(dir_str);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                return self.fail(&app, port, format!("無法建立磁碟快取目錄 {}：{}", dir.display(), e)).await;
+            }
+            Some(dir)
+        } else {
+            None
+        };
+
+        let generation = {
+            let mut rt = self.shared.runtime.lock().await;
+            let generation = self.shared.next_generation();
+            rt.state = ServerStateEnum::Starting;
+            rt.adopted = false;
+            rt.error_message = None;
+            rt.start_time = None;
+            generation
+        };
+        notify_state(Some(&app), &ServerStateEnum::Starting, port);
+        for w in warnings {
+            self.shared.log(Some(&app), w).await;
         }
 
-        let cmd_display = format!("{} {}", resolved_gufo.display(), args.join(" "));
-        self.add_log(format!("[系統] 準備啟動：{}", cmd_display)).await;
+        let args = build_args(&cfg, &resolved_model, mtp.as_deref(), vision.as_deref(), cache_dir.as_deref());
+        self.shared
+            .log(Some(&app), format!("[系統] 準備啟動：{}", redacted_command(&resolved_gufo, &args)))
+            .await;
 
         let mut command = Command::new(&resolved_gufo);
         if let Ok(cwd) = std::env::current_dir() {
@@ -830,248 +892,89 @@ impl GufoManager {
         }
         command
             .args(&args)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-
-        // 在 Windows 隱藏命令列黑視窗
+        // CREATE_NO_WINDOW：隱藏主控台視窗，但保留主控台以便停止時送出 Ctrl+C。
+        // 不可加上 CREATE_NEW_PROCESS_GROUP，否則 Ctrl+C 會被停用。
         #[cfg(target_os = "windows")]
-        {
-            // CREATE_NO_WINDOW = 0x08000000
-            command.creation_flags(0x08000000);
-        }
+        command.creation_flags(0x0800_0000);
 
         let mut spawned = match command.spawn() {
             Ok(c) => c,
-            Err(e) => {
-                let err = format!("無法啟動 Gufo 程序: {}", e);
-                *self.state.lock().await = ServerStateEnum::Error;
-                *self.error_message.lock().await = Some(err.clone());
-                crate::tray::update_tray_status(&app, &ServerStateEnum::Error, cfg.port);
-                let _ = app.emit("gufo-status-changed", "error");
-                return Err(err);
-            }
+            Err(e) => return self.fail(&app, port, format!("無法啟動 Gufo 程序: {}", e)).await,
         };
-
         let stdout = spawned.stdout.take();
         let stderr = spawned.stderr.take();
-
-        // 存入 spawned 進程並立即釋放鎖，防止後續 self.get_status() 發生死鎖
         {
-            let mut child_guard = self.child.lock().await;
-            *child_guard = Some(spawned);
+            let mut rt = self.shared.runtime.lock().await;
+            rt.child = Some(spawned);
+            rt.start_time = Some(Instant::now());
         }
-        *self.start_time.lock().await = Some(Instant::now());
 
-        let port = cfg.port;
-
-        // 啟動 stdout 讀取任務
-        let logs_clone1 = self.recent_logs.clone();
-        let metrics_clone1 = self.recent_metrics.clone();
-        let state_clone1 = self.state.clone();
-        let app_clone1 = app.clone();
         if let Some(stdout) = stdout {
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    let mut logs = logs_clone1.lock().await;
-                    if logs.len() >= 1000 {
-                        logs.pop_front();
-                    }
-                    logs.push_back(line.clone());
-                    let _ = app_clone1.emit("gufo-log", line.clone());
-
-                    // 解析推論度量指標（token/s、prefill_tps、ttft_ms 等）
-                    if let Some(metrics) = InferenceMetrics::parse_log_line(&line) {
-                        let mut m = metrics_clone1.lock().await;
-                        if m.len() >= 50 {
-                            m.pop_front();
-                        }
-                        m.push_back(metrics.clone());
-                        let _ = app_clone1.emit("gufo-metrics", metrics);
-                    }
-
-                    let line_lower = line.to_lowercase();
-                    if line_lower.contains("listening")
-                        || line_lower.contains("serving")
-                        || line_lower.contains("http server")
-                    {
-                        let mut st = state_clone1.lock().await;
-                        if *st == ServerStateEnum::Starting {
-                            *st = ServerStateEnum::Running;
-                            drop(st);
-                            crate::tray::update_tray_status(
-                                &app_clone1,
-                                &ServerStateEnum::Running,
-                                port,
-                            );
-                            let _ = app_clone1.emit("gufo-status-changed", "running");
-                        }
-                    }
-                }
-            });
+            spawn_output_reader(self.shared.clone(), app.clone(), generation, port, stdout);
         }
-
-        // 啟動 stderr 讀取任務
-        let logs_clone2 = self.recent_logs.clone();
-        let metrics_clone2 = self.recent_metrics.clone();
-        let state_clone2 = self.state.clone();
-        let app_clone2 = app.clone();
         if let Some(stderr) = stderr {
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    let mut logs = logs_clone2.lock().await;
-                    if logs.len() >= 1000 {
-                        logs.pop_front();
-                    }
-                    logs.push_back(line.clone());
-                    let _ = app_clone2.emit("gufo-log", line.clone());
-
-                    // 解析推論度量指標（token/s、prefill_tps、ttft_ms 等）
-                    if let Some(metrics) = InferenceMetrics::parse_log_line(&line) {
-                        let mut m = metrics_clone2.lock().await;
-                        if m.len() >= 50 {
-                            m.pop_front();
-                        }
-                        m.push_back(metrics.clone());
-                        let _ = app_clone2.emit("gufo-metrics", metrics);
-                    }
-
-                    let line_lower = line.to_lowercase();
-                    if line_lower.contains("listening")
-                        || line_lower.contains("serving")
-                        || line_lower.contains("http server")
-                    {
-                        let mut st = state_clone2.lock().await;
-                        if *st == ServerStateEnum::Starting {
-                            *st = ServerStateEnum::Running;
-                            drop(st);
-                            crate::tray::update_tray_status(
-                                &app_clone2,
-                                &ServerStateEnum::Running,
-                                port,
-                            );
-                            let _ = app_clone2.emit("gufo-status-changed", "running");
-                        }
-                    }
-                }
-            });
+            spawn_output_reader(self.shared.clone(), app.clone(), generation, port, stderr);
         }
-
-        // 啟動全生命週期監控（包含啟動健康檢查與運行期間意外中止偵測）
-        self.spawn_lifecycle_monitor(
-            app.clone(),
-            cfg.host.clone(),
-            cfg.port,
-            cfg.api_key.trim().to_string(),
-        );
+        spawn_lifecycle_monitor(self.shared.clone(), app.clone(), generation, cfg.host.clone(), port, api_key);
 
         Ok(self.get_status(Some(&app)).await)
     }
 
+    /// 停止伺服器。只會終止本程式啟動的子程序，或在設定 Port 上監聽、且確認為 Gufo 的已接管程序；
+    /// 不會以映像名稱終止其他 Gufo 實例。
     pub async fn stop(&self, app: Option<&AppHandle>) -> Result<ServerStatus, String> {
-        *self.state.lock().await = ServerStateEnum::Stopped;
-        *self.is_adopted.lock().await = false;
-        *self.start_time.lock().await = None;
-        *self.error_message.lock().await = None;
-
-        let maybe_child = {
-            let mut child_guard = self.child.lock().await;
-            child_guard.take()
+        let _op = self.shared.op_lock.lock().await;
+        let (child, adopted) = {
+            let mut rt = self.shared.runtime.lock().await;
+            self.shared.next_generation();
+            let child = rt.child.take();
+            let adopted = rt.adopted;
+            rt.state = ServerStateEnum::Stopped;
+            rt.adopted = false;
+            rt.start_time = None;
+            rt.error_message = None;
+            (child, adopted)
         };
+        let cfg = self.get_config().await;
+        let mut result = Ok(());
 
-        if let Some(mut child) = maybe_child {
-            self.add_log("[系統] 正在停止 Gufo 推理引擎...".to_string()).await;
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            self.add_log("[系統] Gufo 子進程已終止。".to_string()).await;
+        if let Some(child) = child {
+            self.shared
+                .log(app, "[系統] 正在停止 Gufo 推理引擎（先嘗試正常關閉以保存快取）...")
+                .await;
+            let msg = shutdown_child(child).await;
+            self.shared.log(app, msg).await;
+        } else if adopted {
+            self.shared
+                .log(app, format!("[系統] 正在停止已接管的 Gufo 伺服器 (Port {})...", cfg.port))
+                .await;
+            let expected = process_control::expected_gufo_images(&cfg.gufo_path);
+            let port = cfg.port;
+            let outcome = tokio::task::spawn_blocking(move || {
+                process_control::stop_gufo_on_port(port, &expected, GRACEFUL_STOP_TIMEOUT)
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+            match outcome {
+                Ok(msg) => self.shared.log(app, format!("[系統] {}", msg)).await,
+                Err(msg) => {
+                    self.shared.log(app, format!("[錯誤] {}", msg)).await;
+                    result = Err(msg);
+                }
+            }
         }
 
-        // 清理背景可能殘留的孤兒 gufo 進程（確保 Strix Halo 96GB 顯存完全釋放）
-        let killed_count = Self::kill_orphan_gufo_processes().await;
-        if killed_count > 0 {
-            self.add_log(format!(
-                "[系統] 已清理背景殘留的 {} 個 gufo 進程，GPU 顯存已完全釋放。",
-                killed_count
-            ))
-            .await;
-        } else {
-            self.add_log("[系統] GPU 顯存已完全釋放。".to_string()).await;
-        }
-
-        let cfg = self.config.lock().await.clone();
-        if let Some(app_handle) = app {
-            crate::tray::update_tray_status(app_handle, &ServerStateEnum::Stopped, cfg.port);
-            let _ = app_handle.emit("gufo-status-changed", "stopped");
-        }
-
+        notify_state(app, &ServerStateEnum::Stopped, cfg.port);
+        result?;
         Ok(self.get_status(app).await)
     }
 
-    pub async fn kill_orphan_gufo_processes() -> usize {
-        #[cfg(target_os = "windows")]
-        {
-            tokio::task::spawn_blocking(|| {
-                use std::os::windows::process::CommandExt;
-                let mut check_cmd = std::process::Command::new("tasklist");
-                check_cmd.args(&["/FI", "IMAGENAME eq gufo.exe", "/NH"]);
-                check_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-                if let Ok(output) = check_cmd.output() {
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    if text.contains("gufo.exe") {
-                        let mut kill_cmd = std::process::Command::new("taskkill");
-                        kill_cmd.args(&["/F", "/IM", "gufo.exe"]);
-                        kill_cmd.creation_flags(0x08000000);
-                        let _ = kill_cmd.output();
-                        return 1;
-                    }
-                }
-                0
-            })
-            .await
-            .unwrap_or(0)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            tokio::task::spawn_blocking(|| {
-                let mut kill_cmd = std::process::Command::new("pkill");
-                kill_cmd.args(&["-9", "-x", "gufo"]);
-                if let Ok(status) = kill_cmd.status() {
-                    if status.success() {
-                        return 1;
-                    }
-                }
-                0
-            })
-            .await
-            .unwrap_or(0)
-        }
-    }
-
     pub async fn check_health(&self) -> bool {
-        let cfg = self.config.lock().await.clone();
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(600))
-            .build()
-            .unwrap_or_default();
-        let health_url = format!("http://{}:{}/health", cfg.host, cfg.port);
-        let mut req = client.get(&health_url);
-        if !cfg.api_key.trim().is_empty() {
-            req = req.bearer_auth(cfg.api_key.trim());
-        }
-        if let Ok(resp) = req.send().await {
-            resp.status().is_success()
-        } else {
-            false
-        }
-    }
-
-    async fn add_log(&self, line: String) {
-        let mut logs = self.recent_logs.lock().await;
-        if logs.len() >= 1000 {
-            logs.pop_front();
-        }
-        logs.push_back(line);
+        let cfg = self.get_config().await;
+        probe_ready(&http_client(800), &cfg.host, cfg.port, cfg.api_key.trim()).await
     }
 }
 
@@ -1095,17 +998,83 @@ mod tests {
         assert_eq!(config.api_key, "");
         assert!(config.auto_open_gui);
         assert!(!config.auto_start_server);
+        assert_eq!(config.max_tokens, 32768);
+        assert_eq!(config.mtp_draft_vocab, "full");
+        assert!(!config.cache_disk);
 
         // 預設路徑應為相對工作目錄，不應寫死 D:\Agents 或 D:\Models
         assert!(!config.gufo_path.starts_with(r"D:\Agents\gufo"));
         assert!(!config.model_path.starts_with(r"D:\Models\GGUF"));
     }
 
-    #[tokio::test]
-    async fn test_api_key_configuration() {
-        let mut config = GufoServerConfig::default();
-        config.api_key = "sk-gufo-secret-key-123".to_string();
-        assert_eq!(config.api_key, "sk-gufo-secret-key-123");
+    #[test]
+    fn test_legacy_config_json_gets_new_defaults() {
+        let legacy = r#"{"gufo_path":"gufo.exe","model_path":"m.gguf","mtp_path":"","vision_path":"",
+            "served_model_name":"x","host":"127.0.0.1","port":9000,"context":32768,"sessions":1,
+            "max_request_bytes":1,"max_output_bytes":1,"think":"on","temperature":0.7,
+            "speculative":"mtp","mtp_policy":"length","prompt_lookup":false}"#;
+        let cfg: GufoServerConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cfg.port, 9000);
+        assert_eq!(cfg.think, "on");
+        assert!(cfg.auto_open_gui);
+        assert_eq!(cfg.max_tokens, 32768);
+        assert_eq!(cfg.cache_disk_dir, "gufo-cache");
+    }
+
+    #[test]
+    fn test_build_args_includes_optional_flags_and_redacts_key() {
+        let mut cfg = GufoServerConfig::default();
+        cfg.api_key = "sk-gufo-secret".to_string();
+        cfg.draft_tokens = 5;
+        cfg.mtp_draft_vocab = "latin".to_string();
+        cfg.prefill_chunk = 1024;
+        cfg.cache_disk_bytes = 1 << 30;
+        let args = build_args(
+            &cfg,
+            Path::new("model.gguf"),
+            Some(Path::new("mtp.gguf")),
+            None,
+            Some(Path::new("cache dir")),
+        );
+        let joined = args.join(" ");
+        let llm = args.iter().position(|a| a == "llm").unwrap();
+        let key = args.iter().position(|a| a == "--api-key").unwrap();
+        assert!(key < llm, "server options must precede the llm subcommand");
+        for expected in [
+            "--max-tokens 32768",
+            "--speculative mtp --mtp-model mtp.gguf",
+            "--draft-tokens 5",
+            "--mtp-draft-vocab latin",
+            "--prefill-chunk 1024",
+            "--cache-disk cache dir",
+            "--cache-disk-bytes 1073741824",
+            "--prompt-lookup",
+        ] {
+            assert!(joined.contains(expected), "missing `{}` in `{}`", expected, joined);
+        }
+        assert!(!joined.contains("--mmproj"));
+
+        let shown = redacted_command(Path::new("gufo.exe"), &args);
+        assert!(!shown.contains("sk-gufo-secret"));
+        assert!(shown.contains("--api-key ******"));
+        assert!(shown.contains("\"cache dir\""));
+    }
+
+    #[test]
+    fn test_build_args_omits_unset_options() {
+        let mut cfg = GufoServerConfig::default();
+        cfg.max_tokens = 0;
+        let args = build_args(&cfg, Path::new("model.gguf"), None, None, None).join(" ");
+        for absent in ["--api-key", "--max-tokens", "--speculative", "--draft-tokens", "--mtp-draft-vocab", "--prefill-chunk", "--cache-disk"] {
+            assert!(!args.contains(absent), "unexpected `{}` in `{}`", absent, args);
+        }
+    }
+
+    #[test]
+    fn test_listening_detection_ignores_errors() {
+        assert!(is_listening_line("2026-01-01 00:00:00 [INFO] [http] event=listening address=127.0.0.1:12223"));
+        assert!(!is_listening_line("[ERROR] [http] Error starting HTTP server: address in use"));
+        assert!(!is_listening_line("serving model flash-next"));
     }
 
     #[tokio::test]
@@ -1117,28 +1086,30 @@ mod tests {
         assert_eq!(status.pid, None);
         assert_eq!(status.endpoint, "http://127.0.0.1:12223/v1");
 
-        // 測試 stop 不會因為 Mutex 造成死鎖
+        // 未啟動也未接管時，stop 不應終止任何程序，也不會死鎖
         let stop_status = manager.stop(None).await.unwrap();
         assert_eq!(stop_status.state, ServerStateEnum::Stopped);
+    }
+
+    async fn spawn_exiting_child() -> Child {
+        #[cfg(target_os = "windows")]
+        let child = Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap();
+        #[cfg(not(target_os = "windows"))]
+        let child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        child
     }
 
     #[tokio::test]
     async fn test_unexpected_process_exit_resets_status() {
         let manager = GufoManager::new();
-        // 模擬啟動一個立即退出的子進程，且狀態為 Running
-        #[cfg(target_os = "windows")]
-        let child = Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap();
-        #[cfg(not(target_os = "windows"))]
-        let child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        {
+            let mut rt = manager.shared.runtime.lock().await;
+            rt.child = Some(spawn_exiting_child().await);
+            rt.state = ServerStateEnum::Running;
+            rt.start_time = Some(Instant::now());
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
-        *manager.child.lock().await = Some(child);
-        *manager.state.lock().await = ServerStateEnum::Running;
-        *manager.start_time.lock().await = Some(Instant::now());
-
-        // 等待子進程退出
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-        // 查詢狀態時應自動偵測子進程已不存在，並重置為 Stopped
         let status = manager.get_status(None).await;
         assert_eq!(status.state, ServerStateEnum::Stopped);
         assert_eq!(status.pid, None);
@@ -1146,14 +1117,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_exit_during_startup_reports_error() {
+        let manager = GufoManager::new();
+        {
+            let mut rt = manager.shared.runtime.lock().await;
+            rt.child = Some(spawn_exiting_child().await);
+            rt.state = ServerStateEnum::Starting;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let status = manager.get_status(None).await;
+        assert_eq!(status.state, ServerStateEnum::Error);
+        assert!(status.error_message.is_some());
+    }
+
+    #[tokio::test]
     async fn test_resolve_relative_path() {
         let p = GufoManager::resolve_path("Cargo.toml");
-        assert!(p.is_relative() || p.is_absolute());
+        assert!(p.ends_with("Cargo.toml"));
     }
 
     #[test]
     fn test_parse_metrics_log_line() {
-        let sample = "2026-10-24 14:00:00 [INFO] [http] request=r2 event=completed method=POST path=/v1/chat/completions status=200 duration_ms=4520.5 prompt_tokens=512 prefill_tokens=512 generated_tokens=159 ttft_ms=12.5 prefill_tps=1240.5 decode_tps=31.8 draft_accepted=85 draft_proposed=100 acceptance_pct=85.0";
+        let sample = "2026-10-24 14:00:00 [INFO] [http] request=r2 event=completed method=POST path=/v1/chat/completions status=200 duration_ms=4520.5 outcome=completed prompt_tokens=512 prefill_tokens=512 generated_tokens=159 finish=stop cache=miss cached_tokens=0 queue_ms=0.1 ttft_ms=12.5 prefill_tps=1240.5 decode_tps=31.8 batch_width=1 draft_accepted=85 draft_proposed=100 acceptance_pct=85.0";
         let parsed = InferenceMetrics::parse_log_line(sample).expect("Should parse successfully");
         assert_eq!(parsed.request_id, "r2");
         assert_eq!(parsed.method, "POST");
@@ -1169,4 +1155,3 @@ mod tests {
         assert_eq!(parsed.acceptance_pct, Some(85.0));
     }
 }
-

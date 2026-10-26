@@ -47,37 +47,43 @@ export function App() {
     api_key: '',
     auto_open_gui: true,
     auto_start_server: false,
+    max_tokens: 32768,
+    draft_tokens: 0,
+    mtp_draft_vocab: 'full',
+    prefill_chunk: 0,
+    cache_disk: false,
+    cache_disk_dir: 'gufo-cache',
+    cache_disk_bytes: 0,
   });
 
   const [logs, setLogs] = useState<string[]>([]);
 
-  // 載入預設設定與狀態
+  // 載入設定與狀態 (gufo-studio.config.json 為唯一設定來源)
   useEffect(() => {
     const init = async () => {
       try {
-        const defaultCfg = await invoke<GufoServerConfig>('get_default_config');
+        let cfg = await invoke<GufoServerConfig>('get_config');
 
-        // 若 localStorage 存有設定且不是舊版寫死的 D:\Agents 絕對路徑，才使用 localStorage
-        const saved = localStorage.getItem('gufo_studio_config');
-        if (saved) {
+        // 一次性遷移：舊版把設定存在 localStorage，若磁碟尚無設定檔則沿用並寫回磁碟
+        const legacy = localStorage.getItem('gufo_studio_config');
+        if (legacy) {
           try {
-            const parsed = JSON.parse(saved);
-            if (
-              parsed.gufo_path &&
-              !parsed.gufo_path.includes('D:\\Agents\\gufo') &&
-              !parsed.gufo_path.includes('D:/Agents/gufo')
-            ) {
-              setConfig({ ...defaultCfg, ...parsed });
-            } else {
-              setConfig(defaultCfg);
-              localStorage.setItem('gufo_studio_config', JSON.stringify(defaultCfg));
+            const hasSaved = await invoke<boolean>('has_saved_config');
+            const parsed = JSON.parse(legacy);
+            const isStaleAbsolute =
+              typeof parsed.gufo_path === 'string' &&
+              (parsed.gufo_path.includes('D:\\Agents\\gufo') ||
+                parsed.gufo_path.includes('D:/Agents/gufo'));
+            if (!hasSaved && parsed && typeof parsed === 'object' && !isStaleAbsolute) {
+              cfg = { ...cfg, ...parsed };
+              await invoke('save_config', { config: cfg });
             }
-          } catch {
-            setConfig(defaultCfg);
+          } catch (e) {
+            console.warn('舊版設定遷移失敗，改用磁碟設定:', e);
           }
-        } else {
-          setConfig(defaultCfg);
+          localStorage.removeItem('gufo_studio_config');
         }
+        setConfig(cfg);
 
         const currentStatus = await invoke<ServerStatus>('get_server_status');
         setStatus(currentStatus);
@@ -161,24 +167,24 @@ export function App() {
     }
   };
 
-  // 保存設定（同時寫入前端 LocalStorage 與後端便攜設定檔 gufo-studio.config.json）
+  // 保存設定到便攜設定檔 gufo-studio.config.json
   const handleSaveConfig = async (newConfig: GufoServerConfig) => {
     setConfig(newConfig);
-    localStorage.setItem('gufo_studio_config', JSON.stringify(newConfig));
     try {
       await invoke('save_config', { config: newConfig });
     } catch (e) {
-      console.warn('無法儲存設定檔到磁碟:', e);
+      alert(`無法儲存設定檔到磁碟：${e}`);
     }
   };
 
-  // 還原預設配置
+  // 還原預設配置 (同時寫回設定檔)
   const handleResetDefaults = async () => {
     try {
       const defaultCfg = await invoke<GufoServerConfig>('get_default_config');
       setConfig(defaultCfg);
+      await invoke('save_config', { config: defaultCfg });
     } catch (err) {
-      console.error(err);
+      alert(`還原預設配置失敗：${err}`);
     }
   };
 
@@ -196,7 +202,11 @@ export function App() {
 
       <main className="app-body">
         {activeTab === 'chat' && (
-          <ChatView status={status} />
+          <ChatView
+            status={status}
+            defaultThink={config.think === 'on'}
+            defaultTemperature={config.temperature}
+          />
         )}
         {activeTab === 'config' && (
           <ConfigView

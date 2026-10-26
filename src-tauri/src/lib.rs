@@ -1,11 +1,16 @@
 mod commands;
 pub mod gufo_manager;
+mod process_control;
 mod tray;
 pub mod window_state;
 
 use gufo_manager::GufoManager;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{Manager, WindowEvent};
+
+/// 視窗移動/縮放事件會連續大量觸發，延遲 500ms 後只寫入最後一次狀態。
+const WINDOW_STATE_SAVE_DEBOUNCE_MS: u64 = 500;
 
 pub struct AppState {
     pub manager: Arc<GufoManager>,
@@ -38,17 +43,29 @@ pub fn run() {
                 }
 
                 let win_clone = window.clone();
+                let save_ticket = Arc::new(AtomicU64::new(0));
                 window.on_window_event(move |event| {
                     match event {
                         WindowEvent::CloseRequested { api, .. } => {
                             api.prevent_close();
                             // 隱藏至 Tray 前記錄當前視窗狀態
+                            save_ticket.fetch_add(1, Ordering::SeqCst);
                             window_state::save_window_state(&win_clone);
                             let _ = win_clone.hide();
                         }
                         WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
-                            // 移動或縮放時持續記錄
-                            window_state::save_window_state(&win_clone);
+                            let ticket = save_ticket.fetch_add(1, Ordering::SeqCst) + 1;
+                            let ticket_ref = save_ticket.clone();
+                            let win = win_clone.clone();
+                            tauri::async_runtime::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    WINDOW_STATE_SAVE_DEBOUNCE_MS,
+                                ))
+                                .await;
+                                if ticket_ref.load(Ordering::SeqCst) == ticket {
+                                    window_state::save_window_state(&win);
+                                }
+                            });
                         }
                         _ => {}
                     }
@@ -74,6 +91,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_default_config,
+            commands::get_config,
+            commands::has_saved_config,
             commands::save_config,
             commands::get_server_status,
             commands::start_server,

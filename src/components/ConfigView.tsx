@@ -29,6 +29,27 @@ interface ConfigViewProps {
   isRunning: boolean;
 }
 
+const GIB = 1024 ** 3;
+const round2 = (n: number) => Math.round(n * 100) / 100;
+
+const clampNumber = (raw: string, min: number, max: number, fallback: number) => {
+  const n = parseFloat(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+};
+
+const clampInt = (raw: string, min: number, max = Number.MAX_SAFE_INTEGER) =>
+  Math.trunc(clampNumber(raw, min, max, min));
+
+const hintStyle: React.CSSProperties = { fontSize: 11.5, color: '#64748b', marginTop: 2 };
+const checkboxLabelStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  fontSize: 13,
+  cursor: 'pointer',
+};
+
 export const ConfigView: React.FC<ConfigViewProps> = ({
   config: initialConfig,
   onSaveConfig,
@@ -438,6 +459,16 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                   <option value={2}>2 (雙路並發，推薦)</option>
                   <option value={4}>4 (多路並發)</option>
                 </select>
+                <div style={hintStyle}>
+                  每個會話都預先配置完整 context 的 KV 快取。目前 context × sessions ={' '}
+                  {(form.context * form.sessions).toLocaleString()} tokens
+                  {form.context * form.sessions > 262144 && (
+                    <span style={{ color: '#f59e0b' }}>
+                      {' '}
+                      ⚠️ 超過 256K 總量；Flash-Next 單會話 256K 已約需 89 GiB，可能超出 96GB carve-out 而載入失敗或變慢
+                    </span>
+                  )}
+                </div>
               </div>
 
               {/* 投機解碼策略 */}
@@ -454,6 +485,11 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                   <option value="survival">survival (動態生存機率停止 - fast_start 推薦)</option>
                   <option value="length">length (固定長度)</option>
                 </select>
+                {form.mtp_policy === 'survival' && form.temperature <= 0 && (
+                  <div style={hintStyle}>
+                    survival 只在 temperature &gt; 0 時生效；temperature = 0 (貪婪解碼) 時此選項沒有差別。
+                  </div>
+                )}
               </div>
 
               {/* 預設思考模式 */}
@@ -471,6 +507,158 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                   <option value="on">on (開啟深度推導思考)</option>
                   <option value="auto">auto (自動遵循模型提示)</option>
                 </select>
+                <div style={hintStyle}>
+                  僅為伺服器預設值；聊天頁的思考鏈開關會以 <code>chat_template_kwargs.enable_thinking</code> 逐請求覆寫。
+                </div>
+              </div>
+
+              {/* 預設採樣溫度 */}
+              <div className="form-group">
+                <div className="form-label">
+                  <span>預設採樣溫度 (Temperature)</span>
+                </div>
+                <input
+                  type="number"
+                  className="form-input"
+                  min={0}
+                  max={2}
+                  step={0.05}
+                  value={form.temperature}
+                  disabled={isRunning}
+                  onChange={(e) => handleChange('temperature', clampNumber(e.target.value, 0, 2, 0))}
+                />
+                <div style={hintStyle}>0 = 貪婪解碼 (MTP 接受率最高、速度最快)；請求可自行覆寫。</div>
+              </div>
+
+              {/* 預設最大生成長度 */}
+              <div className="form-group">
+                <div className="form-label">
+                  <span>預設最大生成 Tokens (--max-tokens)</span>
+                </div>
+                <input
+                  type="number"
+                  className="form-input"
+                  min={0}
+                  step={1024}
+                  value={form.max_tokens}
+                  disabled={isRunning}
+                  onChange={(e) => handleChange('max_tokens', clampInt(e.target.value, 0))}
+                />
+                <div style={hintStyle}>請求未帶 max_tokens 時的上限；0 = 交給 Gufo 預設 (直到 EOS 或 context 用盡)。</div>
+              </div>
+
+              {/* MTP 草稿長度 */}
+              <div className="form-group">
+                <div className="form-label">
+                  <span>MTP 草稿長度 (--draft-tokens)</span>
+                </div>
+                <input
+                  type="number"
+                  className="form-input"
+                  min={0}
+                  max={16}
+                  value={form.draft_tokens}
+                  disabled={isRunning}
+                  onChange={(e) => handleChange('draft_tokens', clampInt(e.target.value, 0, 16))}
+                />
+                <div style={hintStyle}>0 = Gufo 預設。草稿越長，接受率低時浪費越多運算。</div>
+              </div>
+
+              {/* MTP 草稿詞表 */}
+              <div className="form-group">
+                <div className="form-label">
+                  <span>MTP 草稿詞表 (--mtp-draft-vocab)</span>
+                </div>
+                <select
+                  className="form-input"
+                  value={form.mtp_draft_vocab}
+                  disabled={isRunning}
+                  onChange={(e) => handleChange('mtp_draft_vocab', e.target.value)}
+                >
+                  <option value="full">full (完整詞表，中文推薦)</option>
+                  <option value="latin">latin (僅拉丁字元，英文/程式碼較快)</option>
+                </select>
+                {form.mtp_draft_vocab === 'latin' && (
+                  <div style={{ ...hintStyle, color: '#f59e0b' }}>
+                    latin 詞表無法草擬中文 token，輸出中文時 MTP 接受率會明顯下降。
+                  </div>
+                )}
+              </div>
+
+              {/* Prefill 分塊 */}
+              <div className="form-group">
+                <div className="form-label">
+                  <span>Prefill 分塊大小 (--prefill-chunk)</span>
+                </div>
+                <input
+                  type="number"
+                  className="form-input"
+                  min={0}
+                  step={256}
+                  value={form.prefill_chunk}
+                  disabled={isRunning}
+                  onChange={(e) => handleChange('prefill_chunk', clampInt(e.target.value, 0))}
+                />
+                <div style={hintStyle}>0 = Gufo 預設。較小值可降低並發時其他會話的延遲，但 prefill 吞吐會下降。</div>
+              </div>
+
+              {/* Prompt Lookup */}
+              <div className="form-group">
+                <div className="form-label">
+                  <span>Prompt Lookup 投機 (--prompt-lookup)</span>
+                </div>
+                <label style={checkboxLabelStyle}>
+                  <input
+                    type="checkbox"
+                    checked={form.prompt_lookup}
+                    disabled={isRunning}
+                    onChange={(e) => handleChange('prompt_lookup', e.target.checked)}
+                  />
+                  <span>從輸入內容比對草稿 (改寫、程式碼編輯等重複性高的任務有效)</span>
+                </label>
+              </div>
+
+              {/* 磁碟 Prompt 快取 */}
+              <div className="form-group" style={{ gridColumn: 'span 2' }}>
+                <div className="form-label">
+                  <span>磁碟 Prompt 快取 (--cache-disk)</span>
+                </div>
+                <label style={checkboxLabelStyle}>
+                  <input
+                    type="checkbox"
+                    checked={form.cache_disk}
+                    disabled={isRunning}
+                    onChange={(e) => handleChange('cache_disk', e.target.checked)}
+                  />
+                  <span>將 prompt KV 快取寫入磁碟，重啟後或長 system prompt 可跳過重新 prefill</span>
+                </label>
+                {form.cache_disk && (
+                  <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
+                    <input
+                      type="text"
+                      className="form-input"
+                      style={{ flex: 2 }}
+                      placeholder="快取目錄 (相對路徑以 Gufo Studio 執行目錄為準)"
+                      value={form.cache_disk_dir}
+                      disabled={isRunning}
+                      onChange={(e) => handleChange('cache_disk_dir', e.target.value)}
+                    />
+                    <input
+                      type="number"
+                      className="form-input"
+                      style={{ flex: 1 }}
+                      min={0}
+                      step={1}
+                      title="容量上限 (GiB)，0 = Gufo 預設"
+                      placeholder="容量上限 GiB (0 = 預設)"
+                      value={form.cache_disk_bytes ? round2(form.cache_disk_bytes / GIB) : 0}
+                      disabled={isRunning}
+                      onChange={(e) =>
+                        handleChange('cache_disk_bytes', Math.round(clampNumber(e.target.value, 0, 4096, 0) * GIB))
+                      }
+                    />
+                  </div>
+                )}
               </div>
 
               {/* API Key 安全保護 */}
