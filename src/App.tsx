@@ -64,6 +64,7 @@ export function App() {
     https_port: 12443,
     https_cert_path: '',
     https_key_path: '',
+    https_sans: '',
   });
 
   const [logs, setLogs] = useState<string[]>([]);

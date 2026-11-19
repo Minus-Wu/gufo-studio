@@ -71,7 +71,10 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
 
   const handleRegenerateCert = async () => {
     try {
-      const certPath = await invoke<string>('regenerate_https_cert');
+      const certPath = await invoke<string>('regenerate_https_cert', {
+        host: form.host,
+        httpsSans: form.https_sans,
+      });
       setCertRegenMsg(`已重新產生自簽憑證：${certPath}`);
       setTimeout(() => setCertRegenMsg(null), 5000);
     } catch (err) {
@@ -895,23 +898,38 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                     </div>
 
                     {!form.https_cert_path.trim() && !form.https_key_path.trim() && (
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
-                        <div style={hintStyle}>
-                          未指定自訂憑證時，會自動建立包含 <code>localhost</code>、<code>127.0.0.1</code>、主機名稱與區域網路 IP 的自簽憑證
-                          {status.https_cert_path ? <>（目前憑證：<code>{status.https_cert_path}</code>）</> : ''}。
+                      <>
+                        <div>
+                          <div style={{ fontSize: 11.5, color: '#94a3b8', marginBottom: 4 }}>
+                            額外憑證 SAN（IP / 網域，選填、逗號分隔）
+                          </div>
+                          <input
+                            type="text"
+                            className="form-input"
+                            placeholder="例如: 192.168.122.122, gufo.local（留空仍會自動掃描本機介面 IP）"
+                            value={form.https_sans || ''}
+                            disabled={isRunning}
+                            onChange={(e) => handleChange('https_sans', e.target.value)}
+                          />
                         </div>
-                        <button
-                          type="button"
-                          className="btn btn-secondary"
-                          style={{ fontSize: 12, padding: '5px 10px' }}
-                          disabled={isRunning}
-                          onClick={handleRegenerateCert}
-                          title="若本機區域網路 IP 變更，可重新產生包含最新 IP 的自簽憑證"
-                        >
-                          <RefreshCw size={12} />
-                          <span>重新產生自簽憑證</span>
-                        </button>
-                      </div>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+                          <div style={hintStyle}>
+                            未指定自訂憑證時，會自動建立包含 <code>localhost</code>、<code>127.0.0.1</code>、主機名稱、本機所有網路介面 IP 與上方 SAN 的自簽憑證
+                            {status.https_cert_path ? <>（目前憑證：<code>{status.https_cert_path}</code>）</> : ''}。
+                          </div>
+                          <button
+                            type="button"
+                            className="btn btn-secondary"
+                            style={{ fontSize: 12, padding: '5px 10px' }}
+                            disabled={isRunning}
+                            onClick={handleRegenerateCert}
+                            title="依目前設定與本機介面重新產生自簽憑證"
+                          >
+                            <RefreshCw size={12} />
+                            <span>重新產生自簽憑證</span>
+                          </button>
+                        </div>
+                      </>
                     )}
                     {certRegenMsg && (
                       <div style={{ fontSize: 12, color: '#10b981' }}>{certRegenMsg}</div>
@@ -1045,10 +1063,12 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
         const cleanHost = (form.host || '').trim().replace(/^\[|\]$/g, '');
         const isWildcard = cleanHost === '' || cleanHost === '0.0.0.0' || cleanHost === '::';
         const clientHost = cleanHost === '' || cleanHost === '0.0.0.0' ? '127.0.0.1' : cleanHost === '::' ? '[::1]' : cleanHost.includes(':') ? `[${cleanHost}]` : cleanHost;
+        const firstCustomSan = (form.https_sans || '').split(/[\s,;]+/).map((s) => s.trim()).find((s) => s && s !== '0.0.0.0' && s !== '::');
+        const effectiveLan = firstCustomSan || status.lan_ip;
         const localHttpUrl = `http://${clientHost}:${form.port}/v1`;
         const localHttpsUrl = form.https_enabled ? `https://${clientHost}:${form.https_port}/v1` : null;
-        const lanHttpUrl = isWildcard && status.lan_ip ? `http://${status.lan_ip}:${form.port}/v1` : null;
-        const lanHttpsUrl = isWildcard && form.https_enabled && status.lan_ip ? `https://${status.lan_ip}:${form.https_port}/v1` : null;
+        const lanHttpUrl = isWildcard && effectiveLan ? `http://${effectiveLan}:${form.port}/v1` : null;
+        const lanHttpsUrl = isWildcard && form.https_enabled && effectiveLan ? `https://${effectiveLan}:${form.https_port}/v1` : null;
         return (
         <>
           <div className="config-card">

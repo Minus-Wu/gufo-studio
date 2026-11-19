@@ -59,8 +59,12 @@ pub async fn check_health(state: State<'_, AppState>) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub async fn regenerate_https_cert(state: State<'_, AppState>) -> Result<String, String> {
-    state.manager.regenerate_https_cert().await
+pub async fn regenerate_https_cert(
+    state: State<'_, AppState>,
+    host: Option<String>,
+    https_sans: Option<String>,
+) -> Result<String, String> {
+    state.manager.regenerate_https_cert(host, https_sans).await
 }
 
 #[tauri::command]

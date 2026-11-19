@@ -67,6 +67,8 @@ pub struct GufoServerConfig {
     pub https_cert_path: String,
     /// 自訂 TLS 私鑰 PEM 路徑 (留空則自動產生並重複使用自簽憑證)
     pub https_key_path: String,
+    /// 自動自簽憑證額外包含的 SAN (IP 或網域名稱，逗號分隔)
+    pub https_sans: String,
 }
 
 impl Default for GufoServerConfig {
@@ -132,6 +134,7 @@ impl Default for GufoServerConfig {
             https_port: 12443,
             https_cert_path: String::new(),
             https_key_path: String::new(),
+            https_sans: String::new(),
         }
     }
 }
@@ -723,7 +726,10 @@ impl GufoManager {
         let bind_host = effective_bind_host(&cfg.host);
         let client_host = format_url_host(&connect_host(&bind_host));
         let lan_ip = if is_wildcard_host(&bind_host) {
-            detect_local_ipv4()
+            https_proxy::parse_san_list(&cfg.https_sans)
+                .into_iter()
+                .find(|entry| entry.parse::<std::net::IpAddr>().is_ok())
+                .or_else(detect_local_ipv4)
         } else {
             None
         };
@@ -802,6 +808,14 @@ impl GufoManager {
         cwd.map(|c| c.join(p)).unwrap_or_else(|| p.to_path_buf())
     }
 
+    fn collect_required_sans(bind_host: &str, https_sans: &str) -> Vec<String> {
+        let mut sans = https_proxy::parse_san_list(https_sans);
+        if !is_wildcard_host(bind_host) && !sans.iter().any(|s| s == bind_host) {
+            sans.push(bind_host.to_string());
+        }
+        sans
+    }
+
     async fn start_https_for_config(
         &self,
         cfg: &GufoServerConfig,
@@ -821,11 +835,7 @@ impl GufoManager {
 
         let bind_host = effective_bind_host(&cfg.host);
         let upstream_host = connect_host(&bind_host);
-        let extra_sans = if is_wildcard_host(&bind_host) {
-            Vec::new()
-        } else {
-            vec![bind_host.clone()]
-        };
+        let extra_sans = Self::collect_required_sans(&bind_host, &cfg.https_sans);
 
         let prepared = https_proxy::prepare_tls_server_config(
             &cfg.https_cert_path,
@@ -863,14 +873,15 @@ impl GufoManager {
         Ok(Some((handle, cert_path_str, logs)))
     }
 
-    pub async fn regenerate_https_cert(&self) -> Result<String, String> {
+    pub async fn regenerate_https_cert(
+        &self,
+        override_host: Option<String>,
+        override_sans: Option<String>,
+    ) -> Result<String, String> {
         let cfg = self.get_config().await;
-        let bind_host = effective_bind_host(&cfg.host);
-        let extra_sans = if is_wildcard_host(&bind_host) {
-            Vec::new()
-        } else {
-            vec![bind_host]
-        };
+        let bind_host = effective_bind_host(override_host.as_deref().unwrap_or(&cfg.host));
+        let sans_raw = override_sans.as_deref().unwrap_or(&cfg.https_sans);
+        let extra_sans = Self::collect_required_sans(&bind_host, sans_raw);
         let (cert_path, key_path) = https_proxy::default_cert_paths(&Self::app_base_dir());
         https_proxy::generate_self_signed_cert_files(&cert_path, &key_path, &extra_sans)?;
         Ok(cert_path.to_string_lossy().to_string())
@@ -1174,6 +1185,7 @@ mod tests {
         assert_eq!(config.https_port, 12443);
         assert_eq!(config.https_cert_path, "");
         assert_eq!(config.https_key_path, "");
+        assert_eq!(config.https_sans, "");
         assert_eq!(config.context, 131072);
         assert_eq!(config.sessions, 2);
         assert_eq!(config.served_model_name, "flash-next");

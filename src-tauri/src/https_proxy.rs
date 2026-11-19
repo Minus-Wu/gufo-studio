@@ -3,7 +3,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::BufReader;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +11,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
+use x509_parser::extensions::GeneralName;
 
 pub const DEFAULT_CERT_FILENAME: &str = "gufo-studio.cert.pem";
 pub const DEFAULT_KEY_FILENAME: &str = "gufo-studio.key.pem";
@@ -64,9 +65,45 @@ pub fn detect_local_ipv4() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("192.0.2.1:80").ok()?;
     match socket.local_addr().ok()?.ip() {
-        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
+        IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
         _ => None,
     }
+}
+
+fn is_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+/// 偵測本機所有非 loopback、非 link-local 的網路介面 IP 位址。
+pub fn detect_all_local_ips() -> Vec<String> {
+    let mut ips = BTreeSet::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            let ip = iface.ip();
+            if !ip.is_loopback() && !ip.is_unspecified() && !is_link_local(ip) {
+                ips.insert(ip.to_string());
+            }
+        }
+    }
+    if let Some(primary) = detect_local_ipv4() {
+        ips.insert(primary);
+    }
+    ips.into_iter().collect()
+}
+
+/// 解析以逗號、分號或空白分隔的自訂 SAN 清單。
+pub fn parse_san_list(raw: &str) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for part in raw.split([',', ';', ' ', '\t', '\r', '\n']) {
+        let clean = strip_ipv6_brackets(part);
+        if !clean.is_empty() && !is_wildcard_host(clean) {
+            out.insert(clean.to_string());
+        }
+    }
+    out.into_iter().collect()
 }
 
 pub fn default_cert_paths(base_dir: &Path) -> (PathBuf, PathBuf) {
@@ -82,8 +119,8 @@ fn collect_san_entries(extra_sans: &[String]) -> Vec<String> {
     sans.insert("127.0.0.1".to_string());
     sans.insert("::1".to_string());
 
-    if let Some(lan_ip) = detect_local_ipv4() {
-        sans.insert(lan_ip);
+    for ip in detect_all_local_ips() {
+        sans.insert(ip);
     }
 
     for env_key in ["COMPUTERNAME", "HOSTNAME"] {
@@ -103,6 +140,55 @@ fn collect_san_entries(extra_sans: &[String]) -> Vec<String> {
     }
 
     sans.into_iter().collect()
+}
+
+/// 檢查憑證檔是否已包含所有指定的 SAN (IP 與 DNS 名稱)。
+pub fn cert_contains_all_sans(cert_path: &Path, required_sans: &[String]) -> bool {
+    let required: Vec<String> = required_sans
+        .iter()
+        .map(|s| strip_ipv6_brackets(s))
+        .filter(|s| !s.is_empty() && !is_wildcard_host(s))
+        .map(|s| match s.parse::<IpAddr>() {
+            Ok(ip) => ip.to_string(),
+            Err(_) => s.to_ascii_lowercase(),
+        })
+        .collect();
+    if required.is_empty() {
+        return true;
+    }
+
+    let Ok(cert_bytes) = fs::read(cert_path) else {
+        return false;
+    };
+    let mut reader = BufReader::new(cert_bytes.as_slice());
+    let Some(Ok(first_cert)) = rustls_pemfile::certs(&mut reader).next() else {
+        return false;
+    };
+    let Ok((_, parsed)) = x509_parser::parse_x509_certificate(first_cert.as_ref()) else {
+        return false;
+    };
+    let Ok(Some(san_ext)) = parsed.subject_alternative_name() else {
+        return false;
+    };
+
+    let mut present = BTreeSet::new();
+    for name in &san_ext.value.general_names {
+        match name {
+            GeneralName::DNSName(dns) => {
+                present.insert(dns.to_ascii_lowercase());
+            }
+            GeneralName::IPAddress(bytes) => {
+                if let Ok(octets) = <[u8; 4]>::try_from(*bytes) {
+                    present.insert(IpAddr::V4(Ipv4Addr::from(octets)).to_string());
+                } else if let Ok(octets) = <[u8; 16]>::try_from(*bytes) {
+                    present.insert(IpAddr::V6(Ipv6Addr::from(octets)).to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    required.iter().all(|req| present.contains(req))
 }
 
 /// 產生自簽 TLS 憑證與私鑰並寫入指定路徑。
@@ -233,7 +319,10 @@ where
     let (cert_path, key_path) = default_cert_paths(default_dir);
     let mut newly_created = false;
 
-    let existing = if cert_path.exists() && key_path.exists() {
+    let existing = if cert_path.exists()
+        && key_path.exists()
+        && cert_contains_all_sans(&cert_path, extra_sans)
+    {
         load_rustls_server_config(&cert_path, &key_path).ok()
     } else {
         None
@@ -419,8 +508,34 @@ mod tests {
             .expect("should reuse existing cert");
         assert!(second.auto_generated);
         assert!(!second.newly_created);
+        assert!(cert_contains_all_sans(&second.cert_path, &["192.168.10.20".to_string()]));
+
+        // 若之後新增明確要求的 SAN (如更換服務 IP)，應自動重新簽發包含新 SAN 的憑證
+        let third = prepare_tls_server_config(
+            "",
+            "",
+            &dir,
+            &["203.0.113.42".to_string()],
+            |s| PathBuf::from(s),
+        )
+        .expect("should regenerate cert when new required SAN is added");
+        assert!(third.auto_generated);
+        assert!(third.newly_created);
+        assert!(cert_contains_all_sans(&third.cert_path, &["203.0.113.42".to_string()]));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_san_list() {
+        assert_eq!(
+            parse_san_list("192.168.122.122, gufo.local; [::1] 0.0.0.0"),
+            vec![
+                "192.168.122.122".to_string(),
+                "::1".to_string(),
+                "gufo.local".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

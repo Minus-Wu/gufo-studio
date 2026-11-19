@@ -35,6 +35,7 @@ export interface GufoServerConfig {
   https_port: number;
   https_cert_path: string;
   https_key_path: string;
+  https_sans: string;
 }
 
 export interface ServerStatus {
