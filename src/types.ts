@@ -72,9 +72,18 @@ export interface ChatMetrics {
   /** 實際執行 prefill 的 token 數 (扣除快取命中) */
   prefillTokens?: number;
   prefillTps?: number;
+  prefillMs?: number;
   cachedTokens?: number;
+  cacheSource?: 'memory' | 'disk' | 'miss';
+  cacheHitPct?: number;
+  cacheRestoreMs?: number;
+  cacheMissReason?: string;
+  commonPrefixTokens?: number;
+  nearestCheckpointTokens?: number;
   draftTokens?: number;
   draftAccepted?: number;
+  lookupTokens?: number;
+  lookupAccepted?: number;
 }
 
 export interface ChatMessage {
@@ -98,6 +107,14 @@ export interface ChatSession {
   updatedAt: number;
 }
 
+export interface ActiveInferenceRequest {
+  request_id: string;
+  method: string;
+  path: string;
+  body_bytes: number;
+  timestamp: number;
+}
+
 export interface InferenceMetrics {
   request_id: string;
   method: string;
@@ -113,5 +130,16 @@ export interface InferenceMetrics {
   draft_accepted: number;
   draft_proposed: number;
   acceptance_pct?: number;
+  outcome?: string;
+  finish?: string;
+  cache: 'memory' | 'disk' | 'miss' | string;
+  cached_tokens: number;
+  cache_hit_pct: number;
+  cache_restore_ms: number;
+  cache_miss_reason?: string;
+  common_prefix_tokens?: number;
+  nearest_checkpoint_tokens?: number;
+  lookup_accepted?: number;
+  lookup_proposed?: number;
   timestamp: number;
 }

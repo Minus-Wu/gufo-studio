@@ -7,12 +7,14 @@ import { Header } from './components/Header';
 import { ChatView } from './components/ChatView';
 import { ConfigView } from './components/ConfigView';
 import { LogsView } from './components/LogsView';
-import { GufoServerConfig, InferenceMetrics, ServerStatus } from './types';
+import { ActiveInferenceRequest, GufoServerConfig, InferenceMetrics, ServerStatus } from './types';
 
 export function App() {
   const [activeTab, setActiveTab] = useState<'chat' | 'config' | 'logs'>('chat');
   const [isStarting, setIsStarting] = useState(false);
-  const [latestMetrics, setLatestMetrics] = useState<InferenceMetrics | null>(null);
+  const [metricsHistory, setMetricsHistory] = useState<InferenceMetrics[]>([]);
+  const [activeRequest, setActiveRequest] = useState<ActiveInferenceRequest | null>(null);
+  const latestMetrics = metricsHistory.length > 0 ? metricsHistory[metricsHistory.length - 1] : null;
 
   const [status, setStatus] = useState<ServerStatus>({
     state: 'stopped',
@@ -104,7 +106,7 @@ export function App() {
 
         const recentMetrics = await invoke<InferenceMetrics[]>('get_recent_metrics');
         if (recentMetrics && recentMetrics.length > 0) {
-          setLatestMetrics(recentMetrics[recentMetrics.length - 1]);
+          setMetricsHistory(recentMetrics);
         }
       } catch (err) {
         console.error('初始化失敗:', err);
@@ -118,9 +120,21 @@ export function App() {
       setLogs((prev) => [...prev.slice(-999), event.payload]);
     });
 
-    // 監聽推論指標事件 (反應 token/s 與 prefill 速度)
+    // 監聽推論進行中 / 結束事件
+    const unlistenActivePromise = listen<ActiveInferenceRequest>('gufo-request-active', (event) => {
+      setActiveRequest(event.payload);
+    });
+
+    const unlistenFinishedPromise = listen<string>('gufo-request-finished', (event) => {
+      const finishedId = event.payload;
+      setActiveRequest((prev) => (prev && prev.request_id === finishedId ? null : prev));
+    });
+
+    // 監聽推論指標事件 (反應 token/s 與 prefill / cache 命中率)
     const unlistenMetricsPromise = listen<InferenceMetrics>('gufo-metrics', (event) => {
-      setLatestMetrics(event.payload);
+      const metric = event.payload;
+      setMetricsHistory((prev) => [...prev.slice(-49), metric]);
+      setActiveRequest((prev) => (prev && prev.request_id === metric.request_id ? null : prev));
     });
 
     // 監聽狀態改變事件
@@ -128,6 +142,9 @@ export function App() {
       try {
         const s = await invoke<ServerStatus>('get_server_status');
         setStatus(s);
+        if (s.state !== 'running') {
+          setActiveRequest(null);
+        }
       } catch (e) {
         console.error(e);
       }
@@ -138,6 +155,9 @@ export function App() {
       try {
         const s = await invoke<ServerStatus>('get_server_status');
         setStatus(s);
+        if (s.state !== 'running') {
+          setActiveRequest(null);
+        }
       } catch {
         // 忽略連線輪詢錯誤
       }
@@ -146,6 +166,8 @@ export function App() {
     return () => {
       clearInterval(interval);
       unlistenLogPromise.then((unlisten) => unlisten());
+      unlistenActivePromise.then((unlisten) => unlisten());
+      unlistenFinishedPromise.then((unlisten) => unlisten());
       unlistenMetricsPromise.then((unlisten) => unlisten());
       unlistenStatusPromise.then((unlisten) => unlisten());
     };
@@ -173,6 +195,7 @@ export function App() {
     try {
       const res = await invoke<ServerStatus>('stop_server');
       setStatus(res);
+      setActiveRequest(null);
     } catch (err: any) {
       alert(`停止伺服器失敗：${err}`);
     }
@@ -206,6 +229,7 @@ export function App() {
         setActiveTab={setActiveTab}
         status={status}
         latestMetrics={latestMetrics}
+        activeRequest={activeRequest}
         onStartServer={handleStartServer}
         onStopServer={handleStopServer}
         isStarting={isStarting}
@@ -229,7 +253,12 @@ export function App() {
           />
         )}
         {activeTab === 'logs' && (
-          <LogsView logs={logs} onClearLogs={() => setLogs([])} />
+          <LogsView
+            logs={logs}
+            metricsHistory={metricsHistory}
+            activeRequest={activeRequest}
+            onClearLogs={() => setLogs([])}
+          />
         )}
       </main>
     </>

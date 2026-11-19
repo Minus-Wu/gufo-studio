@@ -179,6 +179,70 @@ pub struct ServerStatus {
     pub lan_ip: Option<String>,
 }
 
+fn now_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActiveInferenceRequest {
+    pub request_id: String,
+    pub method: String,
+    pub path: String,
+    pub body_bytes: u64,
+    pub timestamp: u64,
+}
+
+impl ActiveInferenceRequest {
+    pub fn parse_received_line(line: &str) -> Option<Self> {
+        if !line.contains("[http]") || !line.contains("event=received") {
+            return None;
+        }
+        let mut req = Self {
+            request_id: String::new(),
+            method: String::new(),
+            path: String::new(),
+            body_bytes: 0,
+            timestamp: now_unix_millis(),
+        };
+        for part in line.split_whitespace() {
+            if let Some((k, v)) = part.split_once('=') {
+                match k {
+                    "request" => req.request_id = v.to_string(),
+                    "method" => req.method = v.to_string(),
+                    "path" => req.path = v.to_string(),
+                    "body_bytes" => req.body_bytes = v.parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+        let is_llm_endpoint = matches!(
+            req.path.as_str(),
+            "/v1/chat/completions" | "/v1/completions" | "/v1/responses" | "/v1/messages" | "/completion"
+        );
+        if req.request_id.is_empty() || req.method != "POST" || !is_llm_endpoint {
+            return None;
+        }
+        Some(req)
+    }
+}
+
+pub fn parse_completed_request_id(line: &str) -> Option<String> {
+    if !line.contains("[http]") || !line.contains("event=completed") {
+        return None;
+    }
+    for part in line.split_whitespace() {
+        if let Some(("request", id)) = part.split_once('=') {
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceMetrics {
     pub request_id: String,
@@ -195,6 +259,17 @@ pub struct InferenceMetrics {
     pub draft_accepted: u64,
     pub draft_proposed: u64,
     pub acceptance_pct: Option<f64>,
+    pub outcome: String,
+    pub finish: String,
+    pub cache: String,
+    pub cached_tokens: u64,
+    pub cache_hit_pct: f64,
+    pub cache_restore_ms: f64,
+    pub cache_miss_reason: Option<String>,
+    pub common_prefix_tokens: Option<u64>,
+    pub nearest_checkpoint_tokens: Option<u64>,
+    pub lookup_accepted: u64,
+    pub lookup_proposed: u64,
     pub timestamp: u64,
 }
 
@@ -219,10 +294,18 @@ impl InferenceMetrics {
             draft_accepted: 0,
             draft_proposed: 0,
             acceptance_pct: None,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
+            outcome: "completed".to_string(),
+            finish: "stop".to_string(),
+            cache: "miss".to_string(),
+            cached_tokens: 0,
+            cache_hit_pct: 0.0,
+            cache_restore_ms: 0.0,
+            cache_miss_reason: None,
+            common_prefix_tokens: None,
+            nearest_checkpoint_tokens: None,
+            lookup_accepted: 0,
+            lookup_proposed: 0,
+            timestamp: now_unix_millis(),
         };
 
         for part in line.split_whitespace() {
@@ -242,9 +325,30 @@ impl InferenceMetrics {
                     "draft_accepted" => metrics.draft_accepted = v.parse().unwrap_or(0),
                     "draft_proposed" => metrics.draft_proposed = v.parse().unwrap_or(0),
                     "acceptance_pct" => metrics.acceptance_pct = v.parse().ok(),
+                    "outcome" => metrics.outcome = v.to_string(),
+                    "finish" => metrics.finish = v.to_string(),
+                    "cache" => metrics.cache = v.to_string(),
+                    "cached_tokens" => metrics.cached_tokens = v.parse().unwrap_or(0),
+                    "cache_restore_ms" => metrics.cache_restore_ms = v.parse().unwrap_or(0.0),
+                    "cache_miss_reason" => metrics.cache_miss_reason = Some(v.to_string()),
+                    "common_prefix_tokens" => metrics.common_prefix_tokens = v.parse().ok(),
+                    "nearest_checkpoint_tokens" => metrics.nearest_checkpoint_tokens = v.parse().ok(),
+                    "lookup_accepted" => metrics.lookup_accepted = v.parse().unwrap_or(0),
+                    "lookup_proposed" => metrics.lookup_proposed = v.parse().unwrap_or(0),
                     _ => {}
                 }
             }
+        }
+
+        if metrics.prompt_tokens == 0 && (metrics.prefill_tokens > 0 || metrics.cached_tokens > 0) {
+            metrics.prompt_tokens = metrics.prefill_tokens + metrics.cached_tokens;
+        }
+        if metrics.cached_tokens > 0 && metrics.cache == "miss" {
+            metrics.cache = "memory".to_string();
+        }
+        if metrics.prompt_tokens > 0 {
+            metrics.cache_hit_pct =
+                ((metrics.cached_tokens as f64 * 100.0) / (metrics.prompt_tokens as f64)).min(100.0);
         }
 
         if metrics.draft_proposed > 0 && metrics.acceptance_pct.is_none() {
@@ -525,8 +629,16 @@ where
             let line = String::from_utf8_lossy(&buf)
                 .trim_end_matches(['\r', '\n'])
                 .to_string();
-            if let Some(metrics) = InferenceMetrics::parse_log_line(&line) {
-                shared.push_metrics(Some(&app), metrics).await;
+            if shared.current_generation() == generation {
+                if let Some(active) = ActiveInferenceRequest::parse_received_line(&line) {
+                    let _ = app.emit("gufo-request-active", active);
+                }
+                if let Some(metrics) = InferenceMetrics::parse_log_line(&line) {
+                    shared.push_metrics(Some(&app), metrics).await;
+                }
+                if let Some(req_id) = parse_completed_request_id(&line) {
+                    let _ = app.emit("gufo-request-finished", req_id);
+                }
             }
             let ready = is_listening_line(&line);
             shared.log(Some(&app), line).await;
@@ -1353,12 +1465,66 @@ mod tests {
         assert_eq!(parsed.path, "/v1/chat/completions");
         assert_eq!(parsed.status, 200);
         assert_eq!(parsed.prompt_tokens, 512);
+        assert_eq!(parsed.prefill_tokens, 512);
         assert_eq!(parsed.generated_tokens, 159);
+        assert_eq!(parsed.outcome, "completed");
+        assert_eq!(parsed.finish, "stop");
+        assert_eq!(parsed.cache, "miss");
+        assert_eq!(parsed.cached_tokens, 0);
+        assert!((parsed.cache_hit_pct - 0.0).abs() < 0.01);
         assert!((parsed.prefill_tps - 1240.5).abs() < 0.01);
         assert!((parsed.decode_tps - 31.8).abs() < 0.01);
         assert!((parsed.ttft_ms - 12.5).abs() < 0.01);
         assert_eq!(parsed.draft_accepted, 85);
         assert_eq!(parsed.draft_proposed, 100);
         assert_eq!(parsed.acceptance_pct, Some(85.0));
+    }
+
+    #[test]
+    fn test_parse_metrics_cache_hit_and_miss_diagnostics() {
+        let memory_hit = "2026-11-19 22:00:00 [INFO] [http] request=r8 event=completed method=POST path=/v1/chat/completions status=200 duration_ms=1800.0 outcome=completed prompt_tokens=20000 prefill_tokens=800 generated_tokens=120 finish=stop cache=memory cached_tokens=19200 cache_restore_ms=14.2 queue_ms=0.1 ttft_ms=650.0 prefill_tps=1280.0 decode_tps=42.5 batch_width=1 draft_accepted=60 draft_proposed=80 acceptance_pct=75.0 lookup_accepted=12 lookup_proposed=16";
+        let parsed = InferenceMetrics::parse_log_line(memory_hit).expect("memory hit metrics");
+        assert_eq!(parsed.cache, "memory");
+        assert_eq!(parsed.cached_tokens, 19200);
+        assert_eq!(parsed.prefill_tokens, 800);
+        assert!((parsed.cache_hit_pct - 96.0).abs() < 0.01);
+        assert!((parsed.cache_restore_ms - 14.2).abs() < 0.01);
+        assert_eq!(parsed.lookup_accepted, 12);
+        assert_eq!(parsed.lookup_proposed, 16);
+        assert_eq!(parsed.cache_miss_reason, None);
+
+        let disk_hit = "2026-11-19 22:01:00 [INFO] [http] request=r9 event=completed method=POST path=/v1/responses status=200 duration_ms=2100.0 outcome=completed prompt_tokens=10000 prefill_tokens=0 generated_tokens=50 finish=length cache=disk cached_tokens=10000 cache_restore_ms=85.5 queue_ms=0.2 ttft_ms=90.0 prefill_tps=0.0 decode_tps=40.0 batch_width=1 draft_accepted=0 draft_proposed=0";
+        let parsed_disk = InferenceMetrics::parse_log_line(disk_hit).expect("disk hit metrics");
+        assert_eq!(parsed_disk.cache, "disk");
+        assert_eq!(parsed_disk.finish, "length");
+        assert_eq!(parsed_disk.cached_tokens, 10000);
+        assert_eq!(parsed_disk.prefill_tokens, 0);
+        assert!((parsed_disk.cache_hit_pct - 100.0).abs() < 0.01);
+        assert!((parsed_disk.cache_restore_ms - 85.5).abs() < 0.01);
+
+        let prefix_miss = "2026-11-19 22:02:00 [INFO] [http] request=r10 event=completed method=POST path=/v1/chat/completions status=200 duration_ms=9200.0 outcome=completed prompt_tokens=18000 prefill_tokens=18000 generated_tokens=90 finish=stop cache=miss cached_tokens=0 cache_restore_ms=0.0 queue_ms=0.1 ttft_ms=8100.0 prefill_tps=2200.0 decode_tps=38.0 batch_width=1 draft_accepted=40 draft_proposed=60 cache_miss_reason=prefix_changed common_prefix_tokens=420 nearest_checkpoint_tokens=15000";
+        let parsed_miss = InferenceMetrics::parse_log_line(prefix_miss).expect("prefix miss metrics");
+        assert_eq!(parsed_miss.cache, "miss");
+        assert_eq!(parsed_miss.cached_tokens, 0);
+        assert!((parsed_miss.cache_hit_pct - 0.0).abs() < 0.01);
+        assert_eq!(parsed_miss.cache_miss_reason.as_deref(), Some("prefix_changed"));
+        assert_eq!(parsed_miss.common_prefix_tokens, Some(420));
+        assert_eq!(parsed_miss.nearest_checkpoint_tokens, Some(15000));
+    }
+
+    #[test]
+    fn test_parse_active_and_completed_request_lines() {
+        let received = "2026-11-19 22:05:00 [INFO] [http] request=r15 event=received method=POST path=/v1/chat/completions body_bytes=84320";
+        let active = ActiveInferenceRequest::parse_received_line(received).expect("should parse received POST");
+        assert_eq!(active.request_id, "r15");
+        assert_eq!(active.method, "POST");
+        assert_eq!(active.path, "/v1/chat/completions");
+        assert_eq!(active.body_bytes, 84320);
+
+        let get_models = "2026-11-19 22:05:00 [INFO] [http] request=r16 event=received method=GET path=/v1/models body_bytes=0";
+        assert!(ActiveInferenceRequest::parse_received_line(get_models).is_none());
+
+        let completed = "2026-11-19 22:05:03 [WARN] [http] request=r15 event=completed method=POST path=/v1/chat/completions status=400 duration_ms=1.2 outcome=completed error_code=invalid_messages";
+        assert_eq!(parse_completed_request_id(completed).as_deref(), Some("r15"));
     }
 }

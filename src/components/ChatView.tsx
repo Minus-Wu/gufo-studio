@@ -15,6 +15,7 @@ import {
   X,
 } from 'lucide-react';
 import { ChatMessage, ChatMetrics, MessageImage, ServerStatus } from '../types';
+import { describeCacheMissReason, formatCacheSourceLabel } from '../utils/metricsFormat';
 
 interface ChatViewProps {
   status: ServerStatus;
@@ -36,7 +37,8 @@ function buildServerMetrics(
 ): ChatMetrics {
   const t = timings ?? {};
   const u = usage ?? {};
-  const prefillTokens = num(t.prompt_n);
+  const g = u.gufo ?? {};
+  const prefillTokens = num(t.prompt_n) ?? num(g.prefill_tokens);
   const cachedTokens =
     num(u.prompt_tokens_details?.cached_tokens) ?? num(u.cached_tokens) ?? num(t.cache_n);
   const promptTokens =
@@ -44,17 +46,38 @@ function buildServerMetrics(
     (prefillTokens !== undefined ? prefillTokens + (cachedTokens ?? 0) : undefined);
   const decodeTps = num(t.predicted_per_second) ?? num(u.completion_tokens_per_second);
   const prefillTps = num(t.prompt_per_second) ?? num(u.prompt_tokens_per_second);
+  const cacheDiskHit = g.cache_disk_hit === true;
+  const cacheHit = g.cache_hit === true || (cachedTokens !== undefined && cachedTokens > 0);
+  const cacheSource: ChatMetrics['cacheSource'] = cacheDiskHit
+    ? 'disk'
+    : cacheHit
+    ? 'memory'
+    : 'miss';
+  const cacheHitPct =
+    promptTokens !== undefined && promptTokens > 0 && cachedTokens !== undefined
+      ? Math.min(100, round1((cachedTokens * 100) / promptTokens))
+      : undefined;
+
   return {
     approximate: false,
     completionTokens: num(u.completion_tokens) ?? num(t.predicted_n),
     tokensPerSec: decodeTps !== undefined ? round1(decodeTps) : undefined,
-    ttftMs: num(u.gufo?.ttft_ms) ?? clientTtftMs,
+    ttftMs: num(g.ttft_ms) ?? clientTtftMs,
     promptTokens,
     prefillTokens,
     prefillTps: prefillTps !== undefined && (prefillTokens ?? 1) > 0 ? round1(prefillTps) : undefined,
+    prefillMs: num(t.prompt_ms) ?? num(g.prefill_ms),
     cachedTokens,
+    cacheSource,
+    cacheHitPct,
+    cacheRestoreMs: num(t.cache_restore_ms) ?? num(g.cache_restore_ms),
+    cacheMissReason: typeof g.cache_miss_reason === 'string' ? g.cache_miss_reason : undefined,
+    commonPrefixTokens: num(g.cache_common_prefix_tokens),
+    nearestCheckpointTokens: num(g.cache_checkpoint_tokens),
     draftTokens: num(t.draft_n) ?? num(u.draft_tokens),
     draftAccepted: num(t.draft_n_accepted) ?? num(u.draft_tokens_accepted),
+    lookupTokens: num(t.lookup_n),
+    lookupAccepted: num(t.lookup_n_accepted),
   };
 }
 
@@ -417,12 +440,27 @@ export const ChatView: React.FC<ChatViewProps> = ({
         </span>
       );
     }
-    if (!m.approximate && m.prefillTps !== undefined) {
-      items.push(
-        <span key="prefill" title={`實際 prefill ${m.prefillTokens ?? '?'} tokens`}>
-          Prefill {m.prefillTps} tok/s
-        </span>
-      );
+    if (!m.approximate) {
+      if (m.prefillTokens === 0 && (m.cachedTokens ?? 0) > 0) {
+        items.push(
+          <span key="prefill" title="100% 命中快取，無須重新 Prefill">
+            Prefill 0 tok (快取跳過)
+          </span>
+        );
+      } else if (m.prefillTps !== undefined) {
+        items.push(
+          <span
+            key="prefill"
+            title={
+              m.prefillMs !== undefined
+                ? `實際 prefill ${m.prefillTokens ?? '?'} tokens，耗時 ${round1(m.prefillMs)}ms`
+                : `實際 prefill ${m.prefillTokens ?? '?'} tokens`
+            }
+          >
+            Prefill {m.prefillTps} tok/s ({m.prefillTokens ?? '?'} tok)
+          </span>
+        );
+      }
     }
     if (m.completionTokens !== undefined) {
       items.push(
@@ -433,12 +471,51 @@ export const ChatView: React.FC<ChatViewProps> = ({
         </span>
       );
     }
-    if (!m.approximate && m.cachedTokens) {
-      items.push(<span key="cache">快取命中 {m.cachedTokens} tokens</span>);
+    if (!m.approximate && m.cachedTokens && m.cachedTokens > 0) {
+      const sourceLabel = formatCacheSourceLabel(m.cacheSource);
+      const hitSuffix =
+        m.cacheHitPct !== undefined ? ` (${m.cacheHitPct}% · ${sourceLabel})` : ` (${sourceLabel})`;
+      items.push(
+        <span
+          key="cache"
+          title={
+            m.cacheRestoreMs !== undefined
+              ? `快取來源：${sourceLabel}，還原耗時 ${round1(m.cacheRestoreMs)}ms`
+              : undefined
+          }
+        >
+          快取命中 {m.cachedTokens}
+          {m.promptTokens !== undefined ? `/${m.promptTokens}` : ''}
+          {hitSuffix}
+        </span>
+      );
+    } else if (!m.approximate && m.cachedTokens === 0 && m.cacheMissReason) {
+      items.push(
+        <span
+          key="cache"
+          title={describeCacheMissReason(
+            m.cacheMissReason,
+            m.commonPrefixTokens,
+            m.nearestCheckpointTokens
+          )}
+        >
+          {m.commonPrefixTokens !== undefined && m.commonPrefixTokens > 0
+            ? `快取未命中 (共同前綴 ${m.commonPrefixTokens} tok)`
+            : '快取未命中'}
+        </span>
+      );
     }
     if (!m.approximate && m.draftTokens && m.draftAccepted !== undefined) {
       items.push(
-        <span key="mtp" title={`MTP 草稿接受 ${m.draftAccepted}/${m.draftTokens}`}>
+        <span
+          key="mtp"
+          title={
+            `MTP 草稿接受 ${m.draftAccepted}/${m.draftTokens}` +
+            (m.lookupTokens && m.lookupTokens > 0
+              ? `\nPrompt Lookup 接受 ${m.lookupAccepted ?? 0}/${m.lookupTokens}`
+              : '')
+          }
+        >
           MTP 接受率 {Math.round((m.draftAccepted / m.draftTokens) * 100)}%
         </span>
       );
