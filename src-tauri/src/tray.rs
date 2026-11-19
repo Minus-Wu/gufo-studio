@@ -14,37 +14,48 @@ pub struct TrayMenuState {
 pub fn format_tray_labels(
     server_state: &ServerStateEnum,
     port: u16,
+    https_port: Option<u16>,
 ) -> (String, &'static str, String) {
+    let port_desc = match https_port {
+        Some(hp) => format!("HTTP {} / HTTPS {}", port, hp),
+        None => format!("Port {}", port),
+    };
     match server_state {
         ServerStateEnum::Running => (
-            format!("狀態: 運行中 (Port {})", port),
+            format!("狀態: 運行中 ({})", port_desc),
             "停止推理伺服器",
-            format!("Gufo Studio - 運行中 (Port {})", port),
+            format!("Gufo Studio - 運行中 ({})", port_desc),
         ),
         ServerStateEnum::Starting => (
-            format!("狀態: 啟動中... (Port {})", port),
+            format!("狀態: 啟動中... ({})", port_desc),
             "停止推理伺服器",
-            format!("Gufo Studio - 啟動中... (Port {})", port),
+            format!("Gufo Studio - 啟動中... ({})", port_desc),
         ),
         ServerStateEnum::Error => (
-            format!("狀態: 發生錯誤 (Port {})", port),
+            format!("狀態: 發生錯誤 ({})", port_desc),
             "啟動推理伺服器",
-            format!("Gufo Studio - 發生錯誤 (Port {})", port),
+            format!("Gufo Studio - 發生錯誤 ({})", port_desc),
         ),
         ServerStateEnum::Stopped => (
-            format!("狀態: 已停止 (Port {})", port),
+            format!("狀態: 已停止 ({})", port_desc),
             "啟動推理伺服器",
-            format!("Gufo Studio - 已停止 (Port {})", port),
+            format!("Gufo Studio - 已停止 ({})", port_desc),
         ),
     }
 }
 
-pub fn setup_tray(app: &AppHandle, initial_port: u16) -> Result<(), Box<dyn std::error::Error>> {
+pub fn setup_tray(
+    app: &AppHandle,
+    initial_port: u16,
+    initial_https_port: Option<u16>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (initial_status, _, initial_tooltip) =
+        format_tray_labels(&ServerStateEnum::Stopped, initial_port, initial_https_port);
     let title_item = MenuItem::with_id(app, "title", "🦉 Gufo Studio (Wrapper)", false, None::<&str>)?;
     let status_item = MenuItem::with_id(
         app,
         "status",
-        format!("狀態: 已停止 (Port {})", initial_port),
+        initial_status,
         false,
         None::<&str>,
     )?;
@@ -74,7 +85,7 @@ pub fn setup_tray(app: &AppHandle, initial_port: u16) -> Result<(), Box<dyn std:
     )?;
 
     let _tray = TrayIconBuilder::with_id("gufo-tray")
-        .tooltip(format!("Gufo Studio - 已停止 (Port {})", initial_port))
+        .tooltip(initial_tooltip)
         .icon(app.default_window_icon().unwrap().clone())
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -142,15 +153,21 @@ pub fn setup_tray(app: &AppHandle, initial_port: u16) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-pub fn update_tray_status(app: &AppHandle, server_state: &ServerStateEnum, port: u16) {
+pub fn update_tray_status(
+    app: &AppHandle,
+    server_state: &ServerStateEnum,
+    port: u16,
+    https_port: Option<u16>,
+) {
     #[cfg(test)]
     {
-        let _ = (app, server_state, port);
+        let _ = (app, server_state, port, https_port);
     }
 
     #[cfg(not(test))]
     {
-        let (status_text, toggle_text, tooltip_text) = format_tray_labels(server_state, port);
+        let (status_text, toggle_text, tooltip_text) =
+            format_tray_labels(server_state, port, https_port);
 
         if let Some(tray_state) = app.try_state::<TrayMenuState>() {
             let _ = tray_state.status_item.set_text(&status_text);
@@ -169,19 +186,19 @@ mod tests {
 
     #[test]
     fn test_format_tray_labels_by_state() {
-        let (status, toggle, _) = format_tray_labels(&ServerStateEnum::Stopped, 12223);
+        let (status, toggle, _) = format_tray_labels(&ServerStateEnum::Stopped, 12223, None);
         assert_eq!(status, "狀態: 已停止 (Port 12223)");
         assert_eq!(toggle, "啟動推理伺服器");
 
-        let (status, toggle, _) = format_tray_labels(&ServerStateEnum::Starting, 12223);
+        let (status, toggle, _) = format_tray_labels(&ServerStateEnum::Starting, 12223, None);
         assert_eq!(status, "狀態: 啟動中... (Port 12223)");
         assert_eq!(toggle, "停止推理伺服器");
 
-        let (status, toggle, _) = format_tray_labels(&ServerStateEnum::Running, 12223);
-        assert_eq!(status, "狀態: 運行中 (Port 12223)");
+        let (status, toggle, _) = format_tray_labels(&ServerStateEnum::Running, 12223, Some(12443));
+        assert_eq!(status, "狀態: 運行中 (HTTP 12223 / HTTPS 12443)");
         assert_eq!(toggle, "停止推理伺服器");
 
-        let (status, toggle, _) = format_tray_labels(&ServerStateEnum::Error, 12223);
+        let (status, toggle, _) = format_tray_labels(&ServerStateEnum::Error, 12223, None);
         assert_eq!(status, "狀態: 發生錯誤 (Port 12223)");
         assert_eq!(toggle, "啟動推理伺服器");
     }

@@ -31,6 +31,10 @@ export interface GufoServerConfig {
   cache_disk_dir: string;
   /** 磁碟快取容量上限 bytes (0 = Gufo 預設) */
   cache_disk_bytes: number;
+  https_enabled: boolean;
+  https_port: number;
+  https_cert_path: string;
+  https_key_path: string;
 }
 
 export interface ServerStatus {
@@ -43,6 +47,12 @@ export interface ServerStatus {
   uptime_secs: number;
   error_message: string | null;
   api_key?: string;
+  https_enabled: boolean;
+  https_port: number;
+  https_running: boolean;
+  https_endpoint: string | null;
+  https_cert_path: string | null;
+  lan_ip: string | null;
 }
 
 export interface MessageImage {

@@ -145,7 +145,12 @@ export const Header: React.FC<HeaderProps> = ({
 
         <div
           className="server-badge"
-          title={`點擊複製 OpenAI API 端點：${status.endpoint}${status.api_key ? ' (已啟用 API Key 保護)' : ''}`}
+          title={
+            `點擊複製 OpenAI API 端點：${status.endpoint}` +
+            (status.https_running && status.https_endpoint ? `\nHTTPS 端點：${status.https_endpoint}` : '') +
+            (status.lan_ip ? `\n區域網路 IP：${status.lan_ip}` : '') +
+            (status.api_key ? '\n(已啟用 API Key 保護)' : '')
+          }
           onClick={handleCopyEndpoint}
           style={{ cursor: 'pointer' }}
         >
@@ -157,7 +162,7 @@ export const Header: React.FC<HeaderProps> = ({
           )}
           <span>
             {status.state === 'running'
-              ? `Port ${status.port} (${formatUptime(status.uptime_secs)})`
+              ? `Port ${status.port}${status.https_running ? ` / HTTPS ${status.https_port}` : ''} (${formatUptime(status.uptime_secs)})`
               : status.state === 'starting'
               ? '模型載入中...'
               : status.state === 'error'

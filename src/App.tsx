@@ -18,11 +18,17 @@ export function App() {
     state: 'stopped',
     pid: null,
     port: 12223,
-    host: '127.0.0.1',
+    host: '0.0.0.0',
     served_model_name: 'flash-next',
     endpoint: 'http://127.0.0.1:12223/v1',
     uptime_secs: 0,
     error_message: null,
+    https_enabled: true,
+    https_port: 12443,
+    https_running: false,
+    https_endpoint: 'https://127.0.0.1:12443/v1',
+    https_cert_path: null,
+    lan_ip: null,
   });
 
   const [config, setConfig] = useState<GufoServerConfig>({
@@ -33,7 +39,7 @@ export function App() {
       'models\\Qwen3.8-Flash-Next-GGUF\\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf',
     vision_path: 'models\\Qwen3.8-Flash-Next-GGUF\\mmproj-BF16.gguf',
     served_model_name: 'flash-next',
-    host: '127.0.0.1',
+    host: '0.0.0.0',
     port: 12223,
     context: 131072,
     sessions: 2,
@@ -54,6 +60,10 @@ export function App() {
     cache_disk: false,
     cache_disk_dir: 'gufo-cache',
     cache_disk_bytes: 0,
+    https_enabled: true,
+    https_port: 12443,
+    https_cert_path: '',
+    https_key_path: '',
   });
 
   const [logs, setLogs] = useState<string[]>([]);
@@ -211,9 +221,10 @@ export function App() {
         {activeTab === 'config' && (
           <ConfigView
             config={config}
+            status={status}
             onSaveConfig={handleSaveConfig}
             onResetDefaults={handleResetDefaults}
-            isRunning={status.state === 'running'}
+            isRunning={status.state === 'running' || status.state === 'starting'}
           />
         )}
         {activeTab === 'logs' && (

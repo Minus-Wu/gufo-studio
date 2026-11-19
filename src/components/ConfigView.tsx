@@ -19,11 +19,15 @@ import {
   Terminal,
   Code,
   Zap,
+  Lock,
+  Globe,
+  RefreshCw,
 } from 'lucide-react';
-import { GufoServerConfig } from '../types';
+import { GufoServerConfig, ServerStatus } from '../types';
 
 interface ConfigViewProps {
   config: GufoServerConfig;
+  status: ServerStatus;
   onSaveConfig: (newConfig: GufoServerConfig) => void;
   onResetDefaults: () => void;
   isRunning: boolean;
@@ -52,6 +56,7 @@ const checkboxLabelStyle: React.CSSProperties = {
 
 export const ConfigView: React.FC<ConfigViewProps> = ({
   config: initialConfig,
+  status,
   onSaveConfig,
   onResetDefaults,
   isRunning,
@@ -62,6 +67,17 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
   const [savedSuccess, setSavedSuccess] = useState(false);
   const [prefSaved, setPrefSaved] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
+  const [certRegenMsg, setCertRegenMsg] = useState<string | null>(null);
+
+  const handleRegenerateCert = async () => {
+    try {
+      const certPath = await invoke<string>('regenerate_https_cert');
+      setCertRegenMsg(`已重新產生自簽憑證：${certPath}`);
+      setTimeout(() => setCertRegenMsg(null), 5000);
+    } catch (err) {
+      alert(`重新產生憑證失敗：${err}`);
+    }
+  };
 
   const generateApiKey = () => {
     const randomHex = Array.from(crypto.getRandomValues(new Uint8Array(16)))
@@ -398,17 +414,68 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
             </div>
 
             <div className="form-grid">
+              {/* 監聽位址 (Bind Host) */}
+              <div className="form-group" style={{ gridColumn: 'span 2' }}>
+                <div className="form-label">
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <Globe size={14} color="#06b6d4" />
+                    <span>監聽網路位址 (Bind Host)</span>
+                  </span>
+                  <span style={{ fontSize: 11, color: '#94a3b8' }}>
+                    {form.host === '0.0.0.0' || form.host === '::' || !form.host.trim()
+                      ? '監聽所有 IP（允許區域網路與本機連線）'
+                      : form.host === '127.0.0.1' || form.host === '::1'
+                      ? '僅限本機連線'
+                      : `指定綁定 ${form.host}`}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <input
+                    type="text"
+                    className="form-input"
+                    style={{ flex: 1 }}
+                    value={form.host}
+                    placeholder="0.0.0.0 或 127.0.0.1"
+                    disabled={isRunning}
+                    onChange={(e) => handleChange('host', e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className={`btn ${form.host === '0.0.0.0' ? 'btn-primary' : 'btn-secondary'}`}
+                    style={{ flexShrink: 0, padding: '7px 12px' }}
+                    disabled={isRunning}
+                    onClick={() => handleChange('host', '0.0.0.0')}
+                    title="監聽所有 IPv4 網路介面"
+                  >
+                    0.0.0.0 (所有 IP)
+                  </button>
+                  <button
+                    type="button"
+                    className={`btn ${form.host === '127.0.0.1' ? 'btn-primary' : 'btn-secondary'}`}
+                    style={{ flexShrink: 0, padding: '7px 12px' }}
+                    disabled={isRunning}
+                    onClick={() => handleChange('host', '127.0.0.1')}
+                    title="僅允許本機連線"
+                  >
+                    127.0.0.1 (僅本機)
+                  </button>
+                </div>
+                <div style={hintStyle}>
+                  預設為 <code>0.0.0.0</code> 以監聽所有本機與區域網路 IP（需注意 Windows 防火牆放行，對外建議設定下方 API Key）。
+                </div>
+              </div>
+
               {/* OpenAI API Port */}
               <div className="form-group">
                 <div className="form-label">
-                  <span>OpenAI API 埠號 (Port)</span>
+                  <span>OpenAI API HTTP 埠號 (Port)</span>
                 </div>
                 <input
                   type="number"
                   className="form-input"
                   value={form.port}
                   disabled={isRunning}
-                  onChange={(e) => handleChange('port', parseInt(e.target.value) || 12223)}
+                  onChange={(e) => handleChange('port', clampInt(e.target.value, 1, 65535))}
                 />
               </div>
 
@@ -724,8 +791,133 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                   )}
                 </div>
                 <div style={{ fontSize: 11.5, color: '#64748b', marginTop: 2 }}>
-                  若設定 API Key，外部或本地客戶端（如 Open WebUI, Cursor, VS Code 等）向 <code>http://127.0.0.1:12223/v1</code> 發出請求時，皆必須攜帶 <code>Authorization: Bearer &lt;KEY&gt;</code> 標頭。
+                  若設定 API Key，外部或本地客戶端（如 Open WebUI, Cursor, VS Code 等）向 <code>{status.endpoint}</code>{form.https_enabled ? ` 或 https://127.0.0.1:${form.https_port}/v1` : ''} 發出請求時，皆必須攜帶 <code>Authorization: Bearer &lt;KEY&gt;</code> 標頭。
                 </div>
+              </div>
+
+              {/* HTTPS 安全連線設定 */}
+              <div className="form-group" style={{ gridColumn: 'span 2' }}>
+                <div className="form-label">
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <Lock size={14} color="#38bdf8" />
+                    <span>HTTPS 安全連線設定 (內建 TLS 反向代理)</span>
+                  </span>
+                  <span style={{ fontSize: 11, color: form.https_enabled ? '#10b981' : '#94a3b8' }}>
+                    {form.https_enabled ? `已啟用 (Port ${form.https_port})` : '未啟用'}
+                  </span>
+                </div>
+                <label style={checkboxLabelStyle}>
+                  <input
+                    type="checkbox"
+                    checked={form.https_enabled}
+                    disabled={isRunning}
+                    onChange={(e) => handleChange('https_enabled', e.target.checked)}
+                  />
+                  <span>加開 HTTPS (TLS) 端點，將加密流量轉發至本地 Gufo 引擎（與 HTTP 同時運作）</span>
+                </label>
+                {form.https_enabled && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: '180px 1fr', gap: 8, alignItems: 'center' }}>
+                      <div>
+                        <div style={{ fontSize: 11.5, color: '#94a3b8', marginBottom: 4 }}>HTTPS 埠號</div>
+                        <input
+                          type="number"
+                          className="form-input"
+                          value={form.https_port}
+                          min={1}
+                          max={65535}
+                          disabled={isRunning}
+                          onChange={(e) => handleChange('https_port', clampInt(e.target.value, 1, 65535))}
+                        />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 11.5, color: '#94a3b8', marginBottom: 4 }}>
+                          自訂 TLS 憑證 PEM（選填，留空將自動產生自簽憑證）
+                        </div>
+                        <div className="path-input-group">
+                          <input
+                            type="text"
+                            className="form-input"
+                            placeholder="留空 = 自動產生 gufo-studio.cert.pem"
+                            value={form.https_cert_path || ''}
+                            disabled={isRunning}
+                            onChange={(e) => handleChange('https_cert_path', e.target.value)}
+                          />
+                          <button
+                            type="button"
+                            className="btn btn-secondary"
+                            style={{ flexShrink: 0, padding: '7px 12px' }}
+                            disabled={isRunning}
+                            onClick={() =>
+                              handleBrowse('https_cert_path', '選擇 TLS 憑證檔 (PEM / CRT)', '憑證檔案 (*.pem;*.crt;*.cer)', [
+                                'pem',
+                                'crt',
+                                'cer',
+                              ])
+                            }
+                          >
+                            <FolderOpen size={14} />
+                            <span>瀏覽...</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div>
+                      <div style={{ fontSize: 11.5, color: '#94a3b8', marginBottom: 4 }}>
+                        自訂 TLS 私鑰 PEM（選填，需與上方憑證成對提供）
+                      </div>
+                      <div className="path-input-group">
+                        <input
+                          type="text"
+                          className="form-input"
+                          placeholder="留空 = 自動產生 gufo-studio.key.pem"
+                          value={form.https_key_path || ''}
+                          disabled={isRunning}
+                          onChange={(e) => handleChange('https_key_path', e.target.value)}
+                        />
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          style={{ flexShrink: 0, padding: '7px 12px' }}
+                          disabled={isRunning}
+                          onClick={() =>
+                            handleBrowse('https_key_path', '選擇 TLS 私鑰檔 (PEM / KEY)', '私鑰檔案 (*.pem;*.key)', [
+                              'pem',
+                              'key',
+                            ])
+                          }
+                        >
+                          <FolderOpen size={14} />
+                          <span>瀏覽...</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {!form.https_cert_path.trim() && !form.https_key_path.trim() && (
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+                        <div style={hintStyle}>
+                          未指定自訂憑證時，會自動建立包含 <code>localhost</code>、<code>127.0.0.1</code>、主機名稱與區域網路 IP 的自簽憑證
+                          {status.https_cert_path ? <>（目前憑證：<code>{status.https_cert_path}</code>）</> : ''}。
+                        </div>
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          style={{ fontSize: 12, padding: '5px 10px' }}
+                          disabled={isRunning}
+                          onClick={handleRegenerateCert}
+                          title="若本機區域網路 IP 變更，可重新產生包含最新 IP 的自簽憑證"
+                        >
+                          <RefreshCw size={12} />
+                          <span>重新產生自簽憑證</span>
+                        </button>
+                      </div>
+                    )}
+                    {certRegenMsg && (
+                      <div style={{ fontSize: 12, color: '#10b981' }}>{certRegenMsg}</div>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -849,24 +1041,51 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
       )}
 
       {/* 分頁三：API 串接與效能速度指南 (API & Metrics) */}
-      {subTab === 'api_guide' && (
+      {subTab === 'api_guide' && (() => {
+        const cleanHost = (form.host || '').trim().replace(/^\[|\]$/g, '');
+        const isWildcard = cleanHost === '' || cleanHost === '0.0.0.0' || cleanHost === '::';
+        const clientHost = cleanHost === '' || cleanHost === '0.0.0.0' ? '127.0.0.1' : cleanHost === '::' ? '[::1]' : cleanHost.includes(':') ? `[${cleanHost}]` : cleanHost;
+        const localHttpUrl = `http://${clientHost}:${form.port}/v1`;
+        const localHttpsUrl = form.https_enabled ? `https://${clientHost}:${form.https_port}/v1` : null;
+        const lanHttpUrl = isWildcard && status.lan_ip ? `http://${status.lan_ip}:${form.port}/v1` : null;
+        const lanHttpsUrl = isWildcard && form.https_enabled && status.lan_ip ? `https://${status.lan_ip}:${form.https_port}/v1` : null;
+        return (
         <>
           <div className="config-card">
             <div className="card-title">
               <Code size={18} color="#38bdf8" />
-              <span>本機 OpenAI 相容端點資訊 (API Endpoint)</span>
+              <span>OpenAI 相容端點資訊 (API Endpoints)</span>
             </div>
             <div className="card-subtitle">
-              Gufo 提供 100% 相容 OpenAI Chat Completions 標準規格的本機高效能推論 API。
+              Gufo 提供 100% 相容 OpenAI Chat Completions 標準規格的推論 API，目前綁定於 <code>{cleanHost || '0.0.0.0'}</code>。
             </div>
 
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 12, marginTop: 8 }}>
               <div style={{ background: 'var(--bg-primary)', padding: '12px 14px', borderRadius: 8, border: '1px solid var(--border-color)' }}>
-                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>API Base URL (端點基礎位址)</div>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>本機 HTTP Base URL</div>
                 <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--accent-cyan)', marginTop: 4 }}>
-                  http://{form.host}:{form.port}/v1
+                  {localHttpUrl}
                 </div>
+                {lanHttpUrl && (
+                  <div style={{ fontSize: 11.5, color: 'var(--text-secondary)', marginTop: 4, fontFamily: 'var(--font-mono)' }}>
+                    LAN: {lanHttpUrl}
+                  </div>
+                )}
               </div>
+
+              {localHttpsUrl && (
+                <div style={{ background: 'var(--bg-primary)', padding: '12px 14px', borderRadius: 8, border: '1px solid var(--border-color)' }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>HTTPS Base URL (內建 TLS 代理)</div>
+                  <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 600, color: '#38bdf8', marginTop: 4 }}>
+                    {localHttpsUrl}
+                  </div>
+                  {lanHttpsUrl && (
+                    <div style={{ fontSize: 11.5, color: 'var(--text-secondary)', marginTop: 4, fontFamily: 'var(--font-mono)' }}>
+                      LAN: {lanHttpsUrl}
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div style={{ background: 'var(--bg-primary)', padding: '12px 14px', borderRadius: 8, border: '1px solid var(--border-color)' }}>
                 <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>模型名稱 (Model Identifier)</div>
@@ -882,6 +1101,11 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                 </div>
               </div>
             </div>
+            {form.https_enabled && !form.https_cert_path.trim() && (
+              <div style={{ ...hintStyle, marginTop: 10 }}>
+                使用自動產生的自簽憑證時，於 <code>curl</code> 可加上 <code>--cacert gufo-studio.cert.pem</code>（或測試用 <code>-k</code>），Python <code>requests</code> 可傳入 <code>verify=&quot;{status.https_cert_path || 'gufo-studio.cert.pem'}&quot;</code>。
+              </div>
+            )}
           </div>
 
           {/* 方案 A：如何從 API 獲取推論速度與 Prefill 吞吐量 */}
@@ -906,8 +1130,8 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                 <pre style={{ background: 'var(--bg-secondary)', padding: '10px 12px', borderRadius: 6, fontSize: 12, fontFamily: 'var(--font-mono)', color: '#38bdf8', overflowX: 'auto' }}>
 {`import requests
 
-url = "http://${form.host}:${form.port}/v1/chat/completions"
-headers = {"Content-Type": "application/json"}
+url = "${localHttpUrl}/chat/completions"
+${localHttpsUrl ? `# 或使用 HTTPS 端點: "${localHttpsUrl}/chat/completions"\n` : ''}headers = {"Content-Type": "application/json"}
 ${form.api_key ? `headers["Authorization"] = "Bearer ${form.api_key}"\n` : ''}
 payload = {
     "model": "${form.served_model_name}",
@@ -971,7 +1195,8 @@ with requests.post(url, json=payload, headers=headers, stream=True) as resp:
             </div>
           </div>
         </>
-      )}
+        );
+      })()}
     </div>
   );
 };

@@ -1,5 +1,6 @@
 mod commands;
 pub mod gufo_manager;
+pub mod https_proxy;
 mod process_control;
 mod tray;
 pub mod window_state;
@@ -30,7 +31,11 @@ pub fn run() {
             let initial_config = gufo_manager::GufoManager::load_saved_config().unwrap_or_default();
 
             // 初始化系統匣 (Tray Icon)
-            tray::setup_tray(app.handle(), initial_config.port)?;
+            tray::setup_tray(
+                app.handle(),
+                initial_config.port,
+                initial_config.https_enabled.then_some(initial_config.https_port),
+            )?;
 
             // 監聽視窗關閉事件：關閉時隱藏視窗至 Tray，而非直接退出
             if let Some(window) = app.get_webview_window("main") {
@@ -98,6 +103,7 @@ pub fn run() {
             commands::start_server,
             commands::stop_server,
             commands::check_health,
+            commands::regenerate_https_cert,
             commands::get_recent_logs,
             commands::get_recent_metrics,
             commands::check_path_exists,

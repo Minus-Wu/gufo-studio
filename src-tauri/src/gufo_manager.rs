@@ -10,6 +10,10 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+use crate::https_proxy::{
+    self, HttpsProxyHandle, connect_host, detect_local_ipv4, effective_bind_host, format_url_host,
+    is_wildcard_host,
+};
 use crate::process_control;
 
 const MAX_LOG_LINES: usize = 1000;
@@ -55,6 +59,14 @@ pub struct GufoServerConfig {
     pub cache_disk_dir: String,
     /// 磁碟快取容量上限 bytes (0 = 沿用 Gufo 預設)
     pub cache_disk_bytes: u64,
+    /// 是否啟用內建 HTTPS (TLS) 反向代理
+    pub https_enabled: bool,
+    /// HTTPS 代理監聽埠號 (與 HTTP Port 分開)
+    pub https_port: u16,
+    /// 自訂 TLS 憑證 PEM 路徑 (留空則自動產生並重複使用自簽憑證)
+    pub https_cert_path: String,
+    /// 自訂 TLS 私鑰 PEM 路徑 (留空則自動產生並重複使用自簽憑證)
+    pub https_key_path: String,
 }
 
 impl Default for GufoServerConfig {
@@ -95,7 +107,7 @@ impl Default for GufoServerConfig {
             mtp_path: in_model_dir("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"),
             vision_path: in_model_dir("mmproj-BF16.gguf"),
             served_model_name: "flash-next".to_string(),
-            host: "127.0.0.1".to_string(),
+            host: "0.0.0.0".to_string(),
             port: 12223,
             context: 131072, // 128K context
             sessions: 2,
@@ -116,6 +128,10 @@ impl Default for GufoServerConfig {
             cache_disk: false,
             cache_disk_dir: "gufo-cache".to_string(),
             cache_disk_bytes: 0,
+            https_enabled: true,
+            https_port: 12443,
+            https_cert_path: String::new(),
+            https_key_path: String::new(),
         }
     }
 }
@@ -152,6 +168,12 @@ pub struct ServerStatus {
     pub uptime_secs: u64,
     pub error_message: Option<String>,
     pub api_key: Option<String>,
+    pub https_enabled: bool,
+    pub https_port: u16,
+    pub https_running: bool,
+    pub https_endpoint: Option<String>,
+    pub https_cert_path: Option<String>,
+    pub lan_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,8 +270,9 @@ pub fn build_args(
 ) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     let mut push = |items: &[&str]| args.extend(items.iter().map(|s| s.to_string()));
+    let bind_host = effective_bind_host(&cfg.host);
 
-    push(&["serve", "--host", &cfg.host, "--port", &cfg.port.to_string()]);
+    push(&["serve", "--host", &bind_host, "--port", &cfg.port.to_string()]);
     push(&["--sessions", &cfg.sessions.to_string()]);
     push(&["--max-request-bytes", &cfg.max_request_bytes.to_string()]);
     let api_key = cfg.api_key.trim();
@@ -329,6 +352,8 @@ struct Runtime {
     adopted: bool,
     start_time: Option<Instant>,
     error_message: Option<String>,
+    https_proxy: Option<HttpsProxyHandle>,
+    https_cert_path: Option<String>,
 }
 
 impl Runtime {
@@ -337,6 +362,8 @@ impl Runtime {
         self.child = None;
         self.start_time = None;
         self.adopted = false;
+        self.https_proxy = None;
+        self.https_cert_path = None;
         match self.state {
             ServerStateEnum::Starting => {
                 let msg = format!(
@@ -410,8 +437,19 @@ impl Shared {
         }
     }
 
+    async fn notify_state(&self, app: Option<&AppHandle>, state: &ServerStateEnum) {
+        if let Some(app) = app {
+            let (port, https_port) = {
+                let cfg = self.config.lock().await;
+                (cfg.port, cfg.https_enabled.then_some(cfg.https_port))
+            };
+            crate::tray::update_tray_status(app, state, port, https_port);
+            let _ = app.emit("gufo-status-changed", state.as_str());
+        }
+    }
+
     /// 若仍屬於同一世代且處於 Starting，轉為 Running 並回傳載入耗時。
-    async fn mark_running_if_starting(&self, generation: u64, app: Option<&AppHandle>, port: u16) -> Option<Duration> {
+    async fn mark_running_if_starting(&self, generation: u64, app: Option<&AppHandle>) -> Option<Duration> {
         let elapsed = {
             let mut rt = self.runtime.lock().await;
             if self.current_generation() != generation || rt.state != ServerStateEnum::Starting {
@@ -420,20 +458,13 @@ impl Shared {
             rt.state = ServerStateEnum::Running;
             rt.start_time.get_or_insert_with(Instant::now).elapsed()
         };
-        notify_state(app, &ServerStateEnum::Running, port);
+        self.notify_state(app, &ServerStateEnum::Running).await;
         self.log(
             app,
             format!("[系統] ✅ Gufo 推理伺服器已就緒 (模型載入耗時 {:.1} 秒)。", elapsed.as_secs_f64()),
         )
         .await;
         Some(elapsed)
-    }
-}
-
-fn notify_state(app: Option<&AppHandle>, state: &ServerStateEnum, port: u16) {
-    if let Some(app) = app {
-        crate::tray::update_tray_status(app, state, port);
-        let _ = app.emit("gufo-status-changed", state.as_str());
     }
 }
 
@@ -454,7 +485,8 @@ async fn probe_status(client: &reqwest::Client, url: &str, api_key: &str) -> Opt
 
 /// 以 `/ready` 判斷模型是否可接受推論 (載入中回 503)；舊版 Gufo 無此端點時退回 `/health`。
 async fn probe_ready(client: &reqwest::Client, host: &str, port: u16, api_key: &str) -> bool {
-    let base = format!("http://{}:{}", host, port);
+    let target = connect_host(host);
+    let base = format!("http://{}:{}", format_url_host(&target), port);
     match probe_status(client, &format!("{}/ready", base), api_key).await {
         Some(s) if s.is_success() => true,
         Some(reqwest::StatusCode::NOT_FOUND) => {
@@ -465,7 +497,8 @@ async fn probe_ready(client: &reqwest::Client, host: &str, port: u16, api_key: &
 }
 
 async fn port_open(host: &str, port: u16, timeout: Duration) -> bool {
-    tokio::time::timeout(timeout, tokio::net::TcpStream::connect((host, port)))
+    let target = connect_host(host);
+    tokio::time::timeout(timeout, tokio::net::TcpStream::connect((target.as_str(), port)))
         .await
         .map(|r| r.is_ok())
         .unwrap_or(false)
@@ -473,7 +506,7 @@ async fn port_open(host: &str, port: u16, timeout: Duration) -> bool {
 
 /// 逐行讀取子程序輸出。使用 lossy 解碼，避免非 UTF-8 輸出 (例如系統錯誤訊息)
 /// 讓讀取中斷進而塞滿管線、卡住 Gufo。
-fn spawn_output_reader<R>(shared: Arc<Shared>, app: AppHandle, generation: u64, port: u16, stream: R)
+fn spawn_output_reader<R>(shared: Arc<Shared>, app: AppHandle, generation: u64, stream: R)
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -495,7 +528,7 @@ where
             let ready = is_listening_line(&line);
             shared.log(Some(&app), line).await;
             if ready {
-                shared.mark_running_if_starting(generation, Some(&app), port).await;
+                shared.mark_running_if_starting(generation, Some(&app)).await;
             }
         }
     });
@@ -524,7 +557,7 @@ fn spawn_lifecycle_monitor(shared: Arc<Shared>, app: AppHandle, generation: u64,
                         drop(rt);
                         if let Some((state, msg)) = transition {
                             shared.log(Some(&app), msg).await;
-                            notify_state(Some(&app), &state, port);
+                            shared.notify_state(Some(&app), &state).await;
                         }
                         return;
                     }
@@ -534,7 +567,7 @@ fn spawn_lifecycle_monitor(shared: Arc<Shared>, app: AppHandle, generation: u64,
             }
 
             if probe_ready(&client, &host, port, &api_key).await {
-                shared.mark_running_if_starting(generation, Some(&app), port).await;
+                shared.mark_running_if_starting(generation, Some(&app)).await;
                 break;
             }
             if !hinted && started.elapsed() > SLOW_LOAD_HINT_AFTER {
@@ -566,7 +599,7 @@ fn spawn_lifecycle_monitor(shared: Arc<Shared>, app: AppHandle, generation: u64,
                     drop(rt);
                     if let Some((state, msg)) = transition {
                         shared.log(Some(&app), msg).await;
-                        notify_state(Some(&app), &state, port);
+                        shared.notify_state(Some(&app), &state).await;
                     }
                     return;
                 }
@@ -592,11 +625,13 @@ fn spawn_lifecycle_monitor(shared: Arc<Shared>, app: AppHandle, generation: u64,
             rt.state = ServerStateEnum::Stopped;
             rt.adopted = false;
             rt.start_time = None;
+            rt.https_proxy = None;
+            rt.https_cert_path = None;
             drop(rt);
             shared
                 .log(Some(&app), "[系統] ⚠️ 偵測到外部 Gufo 推理伺服器已中止，狀態已自動重置為已停止。")
                 .await;
-            notify_state(Some(&app), &ServerStateEnum::Stopped, port);
+            shared.notify_state(Some(&app), &ServerStateEnum::Stopped).await;
             return;
         }
     });
@@ -646,12 +681,15 @@ impl GufoManager {
         }
     }
 
-    fn get_config_file_path() -> PathBuf {
-        let exe_dir = std::env::current_exe()
+    fn app_base_dir() -> PathBuf {
+        std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."));
-        exe_dir.join("gufo-studio.config.json")
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    fn get_config_file_path() -> PathBuf {
+        Self::app_base_dir().join("gufo-studio.config.json")
     }
 
     pub fn has_saved_config() -> bool {
@@ -667,7 +705,8 @@ impl GufoManager {
         *self.shared.config.lock().await = cfg.clone();
         if let Some(app_handle) = app {
             let current_state = self.shared.runtime.lock().await.state.clone();
-            crate::tray::update_tray_status(app_handle, &current_state, cfg.port);
+            let https_port = cfg.https_enabled.then_some(cfg.https_port);
+            crate::tray::update_tray_status(app_handle, &current_state, cfg.port, https_port);
         }
         let path = Self::get_config_file_path();
         let json = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
@@ -681,6 +720,13 @@ impl GufoManager {
 
     pub async fn get_status(&self, app: Option<&AppHandle>) -> ServerStatus {
         let cfg = self.shared.config.lock().await.clone();
+        let bind_host = effective_bind_host(&cfg.host);
+        let client_host = format_url_host(&connect_host(&bind_host));
+        let lan_ip = if is_wildcard_host(&bind_host) {
+            detect_local_ipv4()
+        } else {
+            None
+        };
 
         let (status, transition) = {
             let mut rt = self.shared.runtime.lock().await;
@@ -691,23 +737,43 @@ impl GufoManager {
                 (ServerStateEnum::Running, Some(t)) => t.elapsed().as_secs(),
                 _ => 0,
             };
+            let https_running = rt.https_proxy.is_some();
+            let https_cert_path = rt.https_cert_path.clone().or_else(|| {
+                if !cfg.https_enabled {
+                    return None;
+                }
+                if !cfg.https_cert_path.trim().is_empty() {
+                    Some(Self::resolve_path(cfg.https_cert_path.trim()).to_string_lossy().to_string())
+                } else {
+                    let (default_cert, _) = https_proxy::default_cert_paths(&Self::app_base_dir());
+                    default_cert.exists().then(|| default_cert.to_string_lossy().to_string())
+                }
+            });
             let status = ServerStatus {
                 state: rt.state.clone(),
                 pid: rt.child.as_ref().and_then(|c| c.id()),
                 port: cfg.port,
-                host: cfg.host.clone(),
+                host: bind_host.clone(),
                 served_model_name: cfg.served_model_name.clone(),
-                endpoint: format!("http://{}:{}/v1", cfg.host, cfg.port),
+                endpoint: format!("http://{}:{}/v1", client_host, cfg.port),
                 uptime_secs: uptime,
                 error_message: rt.error_message.clone(),
                 api_key: Some(cfg.api_key.trim().to_string()).filter(|k| !k.is_empty()),
+                https_enabled: cfg.https_enabled,
+                https_port: cfg.https_port,
+                https_running,
+                https_endpoint: cfg
+                    .https_enabled
+                    .then(|| format!("https://{}:{}/v1", client_host, cfg.https_port)),
+                https_cert_path,
+                lan_ip,
             };
             (status, transition)
         };
 
         if let Some((state, msg)) = transition {
             self.shared.log(app, msg).await;
-            notify_state(app, &state, cfg.port);
+            self.shared.notify_state(app, &state).await;
         }
         status
     }
@@ -736,8 +802,99 @@ impl GufoManager {
         cwd.map(|c| c.join(p)).unwrap_or_else(|| p.to_path_buf())
     }
 
+    async fn start_https_for_config(
+        &self,
+        cfg: &GufoServerConfig,
+    ) -> Result<Option<(HttpsProxyHandle, String, Vec<String>)>, String> {
+        if !cfg.https_enabled {
+            return Ok(None);
+        }
+        if cfg.https_port == 0 {
+            return Err("HTTPS Port 不可為 0。".to_string());
+        }
+        if cfg.https_port == cfg.port {
+            return Err(format!(
+                "HTTP Port ({}) 與 HTTPS Port ({}) 不可相同，請更換其中一個埠號。",
+                cfg.port, cfg.https_port
+            ));
+        }
+
+        let bind_host = effective_bind_host(&cfg.host);
+        let upstream_host = connect_host(&bind_host);
+        let extra_sans = if is_wildcard_host(&bind_host) {
+            Vec::new()
+        } else {
+            vec![bind_host.clone()]
+        };
+
+        let prepared = https_proxy::prepare_tls_server_config(
+            &cfg.https_cert_path,
+            &cfg.https_key_path,
+            &Self::app_base_dir(),
+            &extra_sans,
+            Self::resolve_path,
+        )?;
+
+        let handle = https_proxy::start_https_proxy(
+            &bind_host,
+            cfg.https_port,
+            &upstream_host,
+            cfg.port,
+            prepared.server_config,
+        )
+        .await?;
+
+        let cert_path_str = prepared.cert_path.to_string_lossy().to_string();
+        let mut logs = Vec::new();
+        if prepared.newly_created {
+            logs.push(format!(
+                "[系統] 🔐 已自動產生本機 HTTPS 自簽憑證：{}",
+                cert_path_str
+            ));
+        }
+        logs.push(format!(
+            "[系統] 🔒 HTTPS 反向代理已監聽 https://{}:{}/v1 -> 轉發至 http://{}:{}/v1",
+            format_url_host(&bind_host),
+            cfg.https_port,
+            format_url_host(&upstream_host),
+            cfg.port
+        ));
+
+        Ok(Some((handle, cert_path_str, logs)))
+    }
+
+    pub async fn regenerate_https_cert(&self) -> Result<String, String> {
+        let cfg = self.get_config().await;
+        let bind_host = effective_bind_host(&cfg.host);
+        let extra_sans = if is_wildcard_host(&bind_host) {
+            Vec::new()
+        } else {
+            vec![bind_host]
+        };
+        let (cert_path, key_path) = https_proxy::default_cert_paths(&Self::app_base_dir());
+        https_proxy::generate_self_signed_cert_files(&cert_path, &key_path, &extra_sans)?;
+        Ok(cert_path.to_string_lossy().to_string())
+    }
+
     /// 將指定 Port 上已就緒的 Gufo 伺服器標記為「已接管」並開始監控。
     async fn adopt_running_server(&self, app: AppHandle, cfg: &GufoServerConfig, message: String) {
+        let https_outcome = self.start_https_for_config(cfg).await;
+        let mut extra_logs = Vec::new();
+        let (https_handle, https_cert_path) = match https_outcome {
+            Ok(Some((handle, cert_path, logs))) => {
+                extra_logs = logs;
+                (Some(handle), Some(cert_path))
+            }
+            Ok(None) => (None, None),
+            Err(err) => {
+                extra_logs.push(format!(
+                    "[警告] HTTPS 反向代理啟動失敗（已接管的 HTTP 服務仍維持運行）：{}",
+                    err
+                ));
+                (None, None)
+            }
+        };
+
         let generation = {
             let mut rt = self.shared.runtime.lock().await;
             let generation = self.shared.next_generation();
@@ -745,15 +902,20 @@ impl GufoManager {
             rt.adopted = true;
             rt.start_time = Some(Instant::now());
             rt.error_message = None;
+            rt.https_proxy = https_handle;
+            rt.https_cert_path = https_cert_path;
             generation
         };
         self.shared.log(Some(&app), message).await;
-        notify_state(Some(&app), &ServerStateEnum::Running, cfg.port);
+        for line in extra_logs {
+            self.shared.log(Some(&app), line).await;
+        }
+        self.shared.notify_state(Some(&app), &ServerStateEnum::Running).await;
         spawn_lifecycle_monitor(
             self.shared.clone(),
             app,
             generation,
-            cfg.host.clone(),
+            connect_host(&cfg.host),
             cfg.port,
             cfg.api_key.trim().to_string(),
         );
@@ -771,16 +933,18 @@ impl GufoManager {
         }
     }
 
-    async fn fail(&self, app: &AppHandle, port: u16, msg: String) -> Result<ServerStatus, String> {
+    async fn fail(&self, app: &AppHandle, msg: String) -> Result<ServerStatus, String> {
         {
             let mut rt = self.shared.runtime.lock().await;
             self.shared.next_generation();
             rt.state = ServerStateEnum::Error;
             rt.error_message = Some(msg.clone());
             rt.start_time = None;
+            rt.https_proxy = None;
+            rt.https_cert_path = None;
         }
         self.shared.log(Some(app), format!("[錯誤] {}", msg)).await;
-        notify_state(Some(app), &ServerStateEnum::Error, port);
+        self.shared.notify_state(Some(app), &ServerStateEnum::Error).await;
         Err(msg)
     }
 
@@ -818,16 +982,16 @@ impl GufoManager {
                 "Port {} 已被佔用但尚未通過就緒檢查（可能是仍在載入模型的 Gufo，或其他程式）。請稍候再試或更換 Port。",
                 port
             );
-            return self.fail(&app, port, msg).await;
+            return self.fail(&app, msg).await;
         }
 
         let resolved_gufo = Self::resolve_path(&cfg.gufo_path);
         if !resolved_gufo.exists() {
-            return self.fail(&app, port, format!("找不到 Gufo 主程式檔案：{}", cfg.gufo_path)).await;
+            return self.fail(&app, format!("找不到 Gufo 主程式檔案：{}", cfg.gufo_path)).await;
         }
         let resolved_model = Self::resolve_path(&cfg.model_path);
         if !resolved_model.exists() {
-            return self.fail(&app, port, format!("找不到模型主檔：{}", cfg.model_path)).await;
+            return self.fail(&app, format!("找不到模型主檔：{}", cfg.model_path)).await;
         }
 
         let mut warnings = Vec::new();
@@ -860,11 +1024,17 @@ impl GufoManager {
             let dir_str = if cfg.cache_disk_dir.trim().is_empty() { "gufo-cache" } else { cfg.cache_disk_dir.trim() };
             let dir = Self::resolve_path(dir_str);
             if let Err(e) = std::fs::create_dir_all(&dir) {
-                return self.fail(&app, port, format!("無法建立磁碟快取目錄 {}：{}", dir.display(), e)).await;
+                return self.fail(&app, format!("無法建立磁碟快取目錄 {}：{}", dir.display(), e)).await;
             }
             Some(dir)
         } else {
             None
+        };
+
+        let (https_handle, https_cert_path, https_logs) = match self.start_https_for_config(&cfg).await {
+            Ok(Some((handle, cert_path, logs))) => (Some(handle), Some(cert_path), logs),
+            Ok(None) => (None, None, Vec::new()),
+            Err(e) => return self.fail(&app, e).await,
         };
 
         let generation = {
@@ -874,11 +1044,16 @@ impl GufoManager {
             rt.adopted = false;
             rt.error_message = None;
             rt.start_time = None;
+            rt.https_proxy = https_handle;
+            rt.https_cert_path = https_cert_path;
             generation
         };
-        notify_state(Some(&app), &ServerStateEnum::Starting, port);
+        self.shared.notify_state(Some(&app), &ServerStateEnum::Starting).await;
         for w in warnings {
             self.shared.log(Some(&app), w).await;
+        }
+        for line in https_logs {
+            self.shared.log(Some(&app), line).await;
         }
 
         let args = build_args(&cfg, &resolved_model, mtp.as_deref(), vision.as_deref(), cache_dir.as_deref());
@@ -902,7 +1077,7 @@ impl GufoManager {
 
         let mut spawned = match command.spawn() {
             Ok(c) => c,
-            Err(e) => return self.fail(&app, port, format!("無法啟動 Gufo 程序: {}", e)).await,
+            Err(e) => return self.fail(&app, format!("無法啟動 Gufo 程序: {}", e)).await,
         };
         let stdout = spawned.stdout.take();
         let stderr = spawned.stderr.take();
@@ -913,12 +1088,12 @@ impl GufoManager {
         }
 
         if let Some(stdout) = stdout {
-            spawn_output_reader(self.shared.clone(), app.clone(), generation, port, stdout);
+            spawn_output_reader(self.shared.clone(), app.clone(), generation, stdout);
         }
         if let Some(stderr) = stderr {
-            spawn_output_reader(self.shared.clone(), app.clone(), generation, port, stderr);
+            spawn_output_reader(self.shared.clone(), app.clone(), generation, stderr);
         }
-        spawn_lifecycle_monitor(self.shared.clone(), app.clone(), generation, cfg.host.clone(), port, api_key);
+        spawn_lifecycle_monitor(self.shared.clone(), app.clone(), generation, connect_host(&cfg.host), port, api_key);
 
         Ok(self.get_status(Some(&app)).await)
     }
@@ -927,17 +1102,25 @@ impl GufoManager {
     /// 不會以映像名稱終止其他 Gufo 實例。
     pub async fn stop(&self, app: Option<&AppHandle>) -> Result<ServerStatus, String> {
         let _op = self.shared.op_lock.lock().await;
-        let (child, adopted) = {
+        let (child, adopted, https_proxy) = {
             let mut rt = self.shared.runtime.lock().await;
             self.shared.next_generation();
             let child = rt.child.take();
             let adopted = rt.adopted;
+            let https_proxy = rt.https_proxy.take();
             rt.state = ServerStateEnum::Stopped;
             rt.adopted = false;
             rt.start_time = None;
             rt.error_message = None;
-            (child, adopted)
+            rt.https_cert_path = None;
+            (child, adopted, https_proxy)
         };
+        if let Some(mut proxy) = https_proxy {
+            proxy.shutdown();
+            self.shared
+                .log(app, "[系統] 🔒 HTTPS 反向代理已停止。")
+                .await;
+        }
         let cfg = self.get_config().await;
         let mut result = Ok(());
 
@@ -967,7 +1150,7 @@ impl GufoManager {
             }
         }
 
-        notify_state(app, &ServerStateEnum::Stopped, cfg.port);
+        self.shared.notify_state(app, &ServerStateEnum::Stopped).await;
         result?;
         Ok(self.get_status(app).await)
     }
@@ -986,7 +1169,11 @@ mod tests {
     async fn test_default_config() {
         let config = GufoServerConfig::default();
         assert_eq!(config.port, 12223);
-        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.host, "0.0.0.0");
+        assert!(config.https_enabled);
+        assert_eq!(config.https_port, 12443);
+        assert_eq!(config.https_cert_path, "");
+        assert_eq!(config.https_key_path, "");
         assert_eq!(config.context, 131072);
         assert_eq!(config.sessions, 2);
         assert_eq!(config.served_model_name, "flash-next");
@@ -1019,6 +1206,8 @@ mod tests {
         assert!(cfg.auto_open_gui);
         assert_eq!(cfg.max_tokens, 32768);
         assert_eq!(cfg.cache_disk_dir, "gufo-cache");
+        assert!(cfg.https_enabled);
+        assert_eq!(cfg.https_port, 12443);
     }
 
     #[test]
@@ -1041,6 +1230,7 @@ mod tests {
         let key = args.iter().position(|a| a == "--api-key").unwrap();
         assert!(key < llm, "server options must precede the llm subcommand");
         for expected in [
+            "--host 0.0.0.0",
             "--max-tokens 32768",
             "--speculative mtp --mtp-model mtp.gguf",
             "--draft-tokens 5",
@@ -1082,9 +1272,14 @@ mod tests {
         let manager = GufoManager::new();
         let status = manager.get_status(None).await;
         assert_eq!(status.state, ServerStateEnum::Stopped);
+        assert_eq!(status.host, "0.0.0.0");
         assert_eq!(status.port, 12223);
         assert_eq!(status.pid, None);
         assert_eq!(status.endpoint, "http://127.0.0.1:12223/v1");
+        assert!(status.https_enabled);
+        assert_eq!(status.https_port, 12443);
+        assert!(!status.https_running);
+        assert_eq!(status.https_endpoint.as_deref(), Some("https://127.0.0.1:12443/v1"));
 
         // 未啟動也未接管時，stop 不應終止任何程序，也不會死鎖
         let stop_status = manager.stop(None).await.unwrap();
