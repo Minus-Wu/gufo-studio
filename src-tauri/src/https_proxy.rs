@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
@@ -371,13 +371,111 @@ impl Drop for HttpsProxyHandle {
     }
 }
 
+const MAX_AUTH_HEADER_BYTES: usize = 64 * 1024;
+const AUTH_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| pos + 4)
+}
+
+fn is_options_request(header_bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(header_bytes);
+    text.lines()
+        .next()
+        .map(|line| line.starts_with("OPTIONS "))
+        .unwrap_or(false)
+}
+
+fn is_authorized_bearer(header_bytes: &[u8], expected_key: &str) -> bool {
+    let text = String::from_utf8_lossy(header_bytes);
+    for line in text.split("\r\n").skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        let trimmed = value.trim();
+        let Some((scheme, token)) = trimmed.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if scheme.eq_ignore_ascii_case("bearer") && token.trim() == expected_key {
+            return true;
+        }
+    }
+    false
+}
+
+enum HeadReadResult {
+    Complete { buf: Vec<u8>, header_end: usize },
+    TooLarge,
+    ClosedOrInvalid,
+}
+
+async fn read_http_head<S>(stream: &mut S) -> HeadReadResult
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 2048];
+    let deadline = tokio::time::Instant::now() + AUTH_HEADER_READ_TIMEOUT;
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return HeadReadResult::ClosedOrInvalid;
+        }
+        let read_res = tokio::time::timeout(deadline - now, stream.read(&mut chunk)).await;
+        match read_res {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return HeadReadResult::ClosedOrInvalid,
+            Ok(Ok(n)) => {
+                if buf.len() + n > MAX_AUTH_HEADER_BYTES {
+                    return HeadReadResult::TooLarge;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(header_end) = find_header_end(&buf) {
+                    return HeadReadResult::Complete { buf, header_end };
+                }
+            }
+        }
+    }
+}
+
+async fn send_http_response<S>(stream: &mut S, raw_response: &[u8])
+where
+    S: AsyncWriteExt + Unpin,
+{
+    let _ = stream.write_all(raw_response).await;
+    let _ = stream.shutdown().await;
+}
+
+async fn send_upstream_unavailable<S>(stream: &mut S)
+where
+    S: AsyncWriteExt + Unpin,
+{
+    let body = r#"{"error":{"message":"Gufo inference server is loading or unavailable"}}"#;
+    let resp = format!(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    send_http_response(stream, resp.as_bytes()).await;
+}
+
 /// 啟動內嵌 HTTPS (TLS) 反向代理，將入站 TLS 連線轉發至本機 Gufo HTTP 伺服器。
+/// 若提供非空的 `api_key`，則於轉發前驗證 `Authorization: Bearer <KEY>` 標頭。
 pub async fn start_https_proxy(
     bind_host: &str,
     https_port: u16,
     upstream_host: &str,
     upstream_port: u16,
     server_config: Arc<rustls::ServerConfig>,
+    api_key: Option<String>,
 ) -> Result<HttpsProxyHandle, String> {
     let bind_ip = effective_bind_host(bind_host);
     let listener = TcpListener::bind((bind_ip.as_str(), https_port))
@@ -388,6 +486,10 @@ pub async fn start_https_proxy(
         .map_err(|e| format!("無法取得 HTTPS 監聽位址: {}", e))?;
 
     let upstream_target = (strip_ipv6_brackets(upstream_host).to_string(), upstream_port);
+    let expected_api_key = api_key
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+        .map(Arc::new);
     let acceptor = TlsAcceptor::from(server_config);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
@@ -404,6 +506,7 @@ pub async fn start_https_proxy(
                         Ok((tcp_stream, _peer)) => {
                             let acceptor = acceptor.clone();
                             let upstream_target = upstream_target.clone();
+                            let expected_api_key = expected_api_key.clone();
                             let mut conn_shutdown = shutdown_rx.clone();
                             tokio::spawn(async move {
                                 let _ = tcp_stream.set_nodelay(true);
@@ -412,23 +515,58 @@ pub async fn start_https_proxy(
                                     Err(_) => return,
                                 };
 
+                                let prefetched = if let Some(ref key) = expected_api_key {
+                                    match read_http_head(&mut tls_stream).await {
+                                        HeadReadResult::Complete { buf, header_end } => {
+                                            let header_slice = &buf[..header_end];
+                                            if !is_authorized_bearer(header_slice, key) {
+                                                if is_options_request(header_slice) {
+                                                    let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS, DELETE\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nConnection: close\r\n\r\n";
+                                                    send_http_response(&mut tls_stream, resp.as_bytes()).await;
+                                                } else {
+                                                    let body = r#"{"error":{"message":"Invalid or missing Bearer API key","type":"invalid_request_error","code":"invalid_api_key"}}"#;
+                                                    let resp = format!(
+                                                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nWWW-Authenticate: Bearer\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                                        body.len(),
+                                                        body
+                                                    );
+                                                    send_http_response(&mut tls_stream, resp.as_bytes()).await;
+                                                }
+                                                return;
+                                            }
+                                            Some(buf)
+                                        }
+                                        HeadReadResult::TooLarge => {
+                                            let body = r#"{"error":{"message":"Request header too large","type":"invalid_request_error","code":"header_too_large"}}"#;
+                                            let resp = format!(
+                                                "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                                body.len(),
+                                                body
+                                            );
+                                            send_http_response(&mut tls_stream, resp.as_bytes()).await;
+                                            return;
+                                        }
+                                        HeadReadResult::ClosedOrInvalid => return,
+                                    }
+                                } else {
+                                    None
+                                };
+
                                 match TcpStream::connect((upstream_target.0.as_str(), upstream_target.1)).await {
                                     Ok(mut upstream) => {
                                         let _ = upstream.set_nodelay(true);
+                                        if let Some(initial_bytes) = prefetched {
+                                            if upstream.write_all(&initial_bytes).await.is_err() {
+                                                return;
+                                            }
+                                        }
                                         tokio::select! {
                                             _ = tokio::io::copy_bidirectional(&mut tls_stream, &mut upstream) => {}
                                             _ = conn_shutdown.changed() => {}
                                         }
                                     }
                                     Err(_) => {
-                                        let body = r#"{"error":{"message":"Gufo inference server is loading or unavailable"}}"#;
-                                        let resp = format!(
-                                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                            body.len(),
-                                            body
-                                        );
-                                        let _ = tls_stream.write_all(resp.as_bytes()).await;
-                                        let _ = tls_stream.shutdown().await;
+                                        send_upstream_unavailable(&mut tls_stream).await;
                                     }
                                 }
                             });
@@ -452,7 +590,6 @@ pub async fn start_https_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
 
     #[test]
     fn test_host_helpers() {
@@ -576,6 +713,7 @@ mod tests {
             "127.0.0.1",
             upstream_port,
             prepared.server_config,
+            None,
         )
         .await
         .expect("start https proxy");
@@ -595,6 +733,87 @@ mod tests {
             .expect("https request should succeed");
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), r#"{"status":"ok"}"#);
+
+        handle.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_https_proxy_enforces_api_key_when_configured() {
+        let dir = std::env::temp_dir().join(format!(
+            "gufo_proxy_auth_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        let prepared = prepare_tls_server_config("", "", &dir, &[], |s| PathBuf::from(s))
+            .expect("generate cert");
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = upstream.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"{"status":"authorized"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let mut handle = start_https_proxy(
+            "127.0.0.1",
+            0,
+            "127.0.0.1",
+            upstream_port,
+            prepared.server_config,
+            Some("sk-test-123".to_string()),
+        )
+        .await
+        .expect("start https proxy with auth");
+        let https_port = handle.local_addr().port();
+
+        let cert_pem = fs::read(&prepared.cert_path).unwrap();
+        let root_cert = reqwest::Certificate::from_pem(&cert_pem).unwrap();
+        let client = reqwest::Client::builder()
+            .add_root_certificate(root_cert)
+            .build()
+            .unwrap();
+
+        let url = format!("https://127.0.0.1:{}/v1/models", https_port);
+
+        // 未帶金鑰 -> 401
+        let unauth_resp = client.get(&url).send().await.expect("unauth request");
+        assert_eq!(unauth_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // 帶錯誤金鑰 -> 401
+        let wrong_resp = client
+            .get(&url)
+            .bearer_auth("sk-wrong")
+            .send()
+            .await
+            .expect("wrong token request");
+        assert_eq!(wrong_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // 帶正確金鑰 -> 200
+        let ok_resp = client
+            .get(&url)
+            .bearer_auth("sk-test-123")
+            .send()
+            .await
+            .expect("authorized request");
+        assert_eq!(ok_resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(ok_resp.text().await.unwrap(), r#"{"status":"authorized"}"#);
 
         handle.shutdown();
         let _ = fs::remove_dir_all(&dir);

@@ -1,6 +1,6 @@
 # 🦉 Gufo Studio
 
-**Gufo Studio** 是專為高效能本地推論引擎 [pixmaate/gufo](https://github.com/pixmaate/gufo)（針對 AMD Strix Halo / Ryzen AI MAX+ 395 / `gfx1151` 架構優化）打造的原生圖形介面包裝器（Desktop Wrapper）。
+**Gufo Studio** 是專為高效能本地推論引擎官方版 [gufo-org/gufo](https://github.com/gufo-org/gufo)（`v0.35.0+`，針對 AMD Strix Halo / Ryzen AI MAX+ 395 / `gfx1151` 架構優化）打造的原生圖形介面包裝器（Desktop Wrapper）。
 
 本專案提供輕量直覺的系統匣常駐圖示（System Tray）與現代化對話介面（Chat UI），預設綁定 `0.0.0.0` 以 HTTP (`12223`) 與內建 HTTPS (`12443`) 雙協定提供 OpenAI 相容 API 服務，讓使用者無需繁瑣的命令列即可享受極速本地與區域網路推論。
 
@@ -25,27 +25,24 @@
 
 3. **專為 Qwen3.8-Flash-Next-GGUF 深度調優**：
    - 預設對接 `D:\Models\GGUF\Qwen3.8-Flash-Next-GGUF`。
-   - 完整支援 `fast_start.ps1` 參數配方：
-     - MTP 投機解碼加速（`--speculative mtp --mtp-policy survival`）
-     - 詞彙前向預測加速（`--prompt-lookup`）
-     - 128K 超長上下文（`--context 131072`）
-     - 雙路並發（`--sessions 2`）
+   - 完整適配官方 `gufo-org/gufo` (`v0.35.0+`) 推論參數：
+     - MTP 投機解碼加速（`--speculative mtp --mtp-model ...`，官方已內建動態草稿長度控制與最長 64-token Prompt Lookup）
+     - 128K / 256K 原生與 400K YaRN 超長上下文（`--context 131072`，超過 262,144 時自動附加 `--enable-yarn`）
+     - 雙路並發與按需映射 KV（`--sessions 2`）
      - 視覺側車側載（`--mmproj mmproj-BF16.gguf`）
      - 零採樣貪婪解碼（`--temperature 0 --think off`）
 
 4. **網路綁定、HTTPS 加密代理與 API Key 保護**：
    - 預設綁定 `0.0.0.0`（可於「配置」頁切換為 `127.0.0.1` 僅限本機）。
    - 內建 TLS 反向代理（預設 Port `12443`）：未指定自訂憑證時會自動產生並保存自簽憑證（`gufo-studio.cert.pem` / `gufo-studio.key.pem`），亦支援載入自訂 PEM 憑證與私鑰。
-   - 支援原生 `--api-key <KEY>` 伺服器安全機制，提供圖形化密碼顯示/隱藏切換與隨機金鑰生成（`sk-gufo-...`）。
-   - 保障區域網路（LAN）或本機服務存取安全，內建 Chat 介面與健康檢查探測自動附加金鑰。
+   - 配合官方 `gufo-org/gufo` 將認證交由前置代理的設計，當設定 API Key（支援圖形化密碼顯示/隱藏與隨機生成 `sk-gufo-...`）時，由內建 HTTPS 反向代理強制驗證 `Authorization: Bearer <KEY>`；底層 HTTP 維持原生直連。
 
 5. **即時日誌流與狀態儀表板 (Live Logs & Dashboard)**：
    - 即時捕捉 Gufo 的 stdout / stderr。
-   - 查看 AMD ROCm 初始化、GPU VRAM 記憶體佔用與模型分塊進度。
-   - 日誌中的啟動命令會自動遮蔽 `--api-key` 的值。
+   - 查看 AMD ROCm 初始化、GPU / NPU 狀態、記憶體佔用與請求級別 `timings` / 快取命中細節。
 
 6. **可調整的進階推論參數**：
-   - `--max-tokens`（預設生成上限）、`--draft-tokens`、`--mtp-draft-vocab full|latin`、`--prefill-chunk`、`--prompt-lookup`、預設 `--temperature`。
+   - `--max-tokens`（預設生成上限）、`--speculative`（`mtp` / `off`）、預設 `--temperature`、`--think`。
    - 磁碟 Prompt 快取：`--cache-disk <DIR>` 與 `--cache-disk-bytes`。
    - 數值為 0 表示不傳該參數、交給 Gufo 預設值。
 
@@ -68,10 +65,8 @@ Gufo README 的峰值數據（例如 prefill ≈ 1600 tok/s、單路 decode ≈ 
 | 單路 Decode | 約 32–35 tok/s |
 
 影響因素：
-- **carve-out 小於 96GB** 時，載入時間變長（64GB 約 2 分鐘）且 decode 變慢。
-- **context × sessions** 決定預先配置的 KV 快取大小；Flash-Next 256K 單會話約需 89 GiB。
-- `--mtp-policy survival` 只在 temperature > 0 時生效。
-- `--mtp-draft-vocab latin` 只適合英文/程式碼輸出，中文輸出會降低 MTP 接受率。
+- **carve-out 或可用記憶體不足** 時，載入與運算會受影響（官方 `v0.35.0+` 已支援按需映射 KV 與記憶體壓力釋放，但大尺寸模型仍建議保留充足空間）。
+- **context × sessions** 影響 KV 配置與並發排隊行為；超過 262,144 tokens 會自動啟用 YaRN 擴展（`--enable-yarn`）。
 - 聊天頁面顯示的是伺服器回傳的 `timings` / `usage`，可直接與 Gufo 日誌中的 `decode_tps`、`prefill_tps` 對照。
 
 ---

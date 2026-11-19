@@ -367,7 +367,7 @@ fn is_listening_line(line: &str) -> bool {
     line.contains("event=listening")
 }
 
-/// 組裝 `gufo serve ... llm ...` 參數。純函式，方便測試。
+/// 組裝官方 `gufo-org/gufo` (`v0.35.0+`) `gufo serve ... llm ...` 參數。純函式，方便測試。
 pub fn build_args(
     cfg: &GufoServerConfig,
     model: &Path,
@@ -375,6 +375,8 @@ pub fn build_args(
     vision: Option<&Path>,
     cache_dir: Option<&Path>,
 ) -> Vec<String> {
+    const FLASH_NEXT_NATIVE_CONTEXT: u32 = 262_144;
+
     let mut args: Vec<String> = Vec::new();
     let mut push = |items: &[&str]| args.extend(items.iter().map(|s| s.to_string()));
     let bind_host = effective_bind_host(&cfg.host);
@@ -382,14 +384,13 @@ pub fn build_args(
     push(&["serve", "--host", &bind_host, "--port", &cfg.port.to_string()]);
     push(&["--sessions", &cfg.sessions.to_string()]);
     push(&["--max-request-bytes", &cfg.max_request_bytes.to_string()]);
-    let api_key = cfg.api_key.trim();
-    if !api_key.is_empty() {
-        push(&["--api-key", api_key]);
-    }
 
     push(&["llm", "--model", &model.to_string_lossy()]);
     push(&["--served-model-name", &cfg.served_model_name]);
     push(&["--context", &cfg.context.to_string()]);
+    if cfg.context > FLASH_NEXT_NATIVE_CONTEXT {
+        push(&["--enable-yarn"]);
+    }
     push(&["--max-output-bytes", &cfg.max_output_bytes.to_string()]);
     push(&["--think", &cfg.think]);
     push(&["--temperature", &cfg.temperature.to_string()]);
@@ -399,23 +400,8 @@ pub fn build_args(
 
     if let Some(mtp) = mtp {
         push(&["--speculative", "mtp", "--mtp-model", &mtp.to_string_lossy()]);
-        if !cfg.mtp_policy.is_empty() {
-            push(&["--mtp-policy", &cfg.mtp_policy]);
-        }
-        if cfg.draft_tokens > 0 {
-            push(&["--draft-tokens", &cfg.draft_tokens.to_string()]);
-        }
-        if cfg.mtp_draft_vocab == "latin" {
-            push(&["--mtp-draft-vocab", "latin"]);
-        }
     }
 
-    if cfg.prompt_lookup {
-        push(&["--prompt-lookup"]);
-    }
-    if cfg.prefill_chunk > 0 {
-        push(&["--prefill-chunk", &cfg.prefill_chunk.to_string()]);
-    }
     if let Some(dir) = cache_dir {
         push(&["--cache-disk", &dir.to_string_lossy()]);
         if cfg.cache_disk_bytes > 0 {
@@ -957,12 +943,14 @@ impl GufoManager {
             Self::resolve_path,
         )?;
 
+        let api_key_opt = Some(cfg.api_key.trim().to_string()).filter(|k| !k.is_empty());
         let handle = https_proxy::start_https_proxy(
             &bind_host,
             cfg.https_port,
             &upstream_host,
             cfg.port,
             prepared.server_config,
+            api_key_opt.clone(),
         )
         .await?;
 
@@ -974,12 +962,18 @@ impl GufoManager {
                 cert_path_str
             ));
         }
+        let auth_suffix = if api_key_opt.is_some() {
+            "（已啟用 Bearer API Key 驗證）"
+        } else {
+            ""
+        };
         logs.push(format!(
-            "[系統] 🔒 HTTPS 反向代理已監聽 https://{}:{}/v1 -> 轉發至 http://{}:{}/v1",
+            "[系統] 🔒 HTTPS 反向代理已監聽 https://{}:{}/v1 -> 轉發至 http://{}:{}/v1{}",
             format_url_host(&bind_host),
             cfg.https_port,
             format_url_host(&upstream_host),
-            cfg.port
+            cfg.port,
+            auth_suffix
         ));
 
         Ok(Some((handle, cert_path_str, logs)))
@@ -1335,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_args_includes_optional_flags_and_redacts_key() {
+    fn test_build_args_official_gufo_cli_and_yarn() {
         let mut cfg = GufoServerConfig::default();
         cfg.api_key = "sk-gufo-secret".to_string();
         cfg.draft_tokens = 5;
@@ -1350,28 +1344,41 @@ mod tests {
             Some(Path::new("cache dir")),
         );
         let joined = args.join(" ");
-        let llm = args.iter().position(|a| a == "llm").unwrap();
-        let key = args.iter().position(|a| a == "--api-key").unwrap();
-        assert!(key < llm, "server options must precede the llm subcommand");
         for expected in [
             "--host 0.0.0.0",
             "--max-tokens 32768",
             "--speculative mtp --mtp-model mtp.gguf",
-            "--draft-tokens 5",
-            "--mtp-draft-vocab latin",
-            "--prefill-chunk 1024",
             "--cache-disk cache dir",
             "--cache-disk-bytes 1073741824",
-            "--prompt-lookup",
         ] {
             assert!(joined.contains(expected), "missing `{}` in `{}`", expected, joined);
         }
-        assert!(!joined.contains("--mmproj"));
+        for removed in [
+            "--api-key",
+            "--mtp-policy",
+            "--mtp-draft-vocab",
+            "--prompt-lookup",
+            "--draft-tokens",
+            "--prefill-chunk",
+            "--enable-yarn",
+            "--mmproj",
+        ] {
+            assert!(!joined.contains(removed), "unexpected `{}` in `{}`", removed, joined);
+        }
+
+        cfg.context = 409_600;
+        let yarn_args = build_args(&cfg, Path::new("model.gguf"), None, None, None).join(" ");
+        assert!(yarn_args.contains("--context 409600"));
+        assert!(yarn_args.contains("--enable-yarn"));
 
         let shown = redacted_command(Path::new("gufo.exe"), &args);
-        assert!(!shown.contains("sk-gufo-secret"));
-        assert!(shown.contains("--api-key ******"));
         assert!(shown.contains("\"cache dir\""));
+        let masked = redacted_command(
+            Path::new("gufo.exe"),
+            &["--api-key".to_string(), "sk-gufo-secret".to_string()],
+        );
+        assert!(!masked.contains("sk-gufo-secret"));
+        assert!(masked.contains("--api-key ******"));
     }
 
     #[test]
@@ -1379,7 +1386,16 @@ mod tests {
         let mut cfg = GufoServerConfig::default();
         cfg.max_tokens = 0;
         let args = build_args(&cfg, Path::new("model.gguf"), None, None, None).join(" ");
-        for absent in ["--api-key", "--max-tokens", "--speculative", "--draft-tokens", "--mtp-draft-vocab", "--prefill-chunk", "--cache-disk"] {
+        for absent in [
+            "--api-key",
+            "--max-tokens",
+            "--speculative",
+            "--draft-tokens",
+            "--mtp-draft-vocab",
+            "--prefill-chunk",
+            "--cache-disk",
+            "--enable-yarn",
+        ] {
             assert!(!args.contains(absent), "unexpected `{}` in `{}`", absent, args);
         }
     }

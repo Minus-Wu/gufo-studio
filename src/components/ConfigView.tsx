@@ -510,14 +510,20 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                   <option value={32768}>32,768 (32K)</option>
                   <option value={65536}>65,536 (64K)</option>
                   <option value={131072}>131,072 (128K 推薦)</option>
-                  <option value={262144}>262,144 (256K 全開)</option>
+                  <option value={262144}>262,144 (256K 原生上限)</option>
+                  <option value={409600}>409,600 (400K YaRN 擴展)</option>
                 </select>
+                {form.context > 262144 && (
+                  <div style={hintStyle}>
+                    超過 262,144 原生上下文時，啟動時會自動附加官方 <code>--enable-yarn</code> 旗標進行位置編碼擴展。
+                  </div>
+                )}
               </div>
 
               {/* GPU 並發 Sessions */}
               <div className="form-group">
                 <div className="form-label">
-                  <span>GPU 預先分配會話數 (Sessions)</span>
+                  <span>GPU 並發會話數 (Sessions)</span>
                 </div>
                 <select
                   className="form-input"
@@ -530,36 +536,27 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                   <option value={4}>4 (多路並發)</option>
                 </select>
                 <div style={hintStyle}>
-                  每個會話都預先配置完整 context 的 KV 快取。目前 context × sessions ={' '}
-                  {(form.context * form.sessions).toLocaleString()} tokens
-                  {form.context * form.sessions > 262144 && (
-                    <span style={{ color: '#f59e0b' }}>
-                      {' '}
-                      ⚠️ 超過 256K 總量；Flash-Next 單會話 256K 已約需 89 GiB，可能超出 96GB carve-out 而載入失敗或變慢
-                    </span>
-                  )}
+                  目前 context × sessions = {(form.context * form.sessions).toLocaleString()} tokens。官方 <code>v0.35.0+</code> 支援按需映射 (Demand-mapped) KV 狀態與動態會話共享；若硬體可用記憶體小於 96GB，過大的配置仍可能影響載入與並發排隊。
                 </div>
               </div>
 
-              {/* 投機解碼策略 */}
+              {/* 投機解碼模式 */}
               <div className="form-group">
                 <div className="form-label">
-                  <span>MTP 投機解碼策略 (Policy)</span>
+                  <span>投機解碼模式 (--speculative)</span>
                 </div>
                 <select
                   className="form-input"
-                  value={form.mtp_policy}
+                  value={form.speculative === 'off' ? 'off' : 'mtp'}
                   disabled={isRunning}
-                  onChange={(e) => handleChange('mtp_policy', e.target.value)}
+                  onChange={(e) => handleChange('speculative', e.target.value)}
                 >
-                  <option value="survival">survival (動態生存機率停止 - fast_start 推薦)</option>
-                  <option value="length">length (固定長度)</option>
+                  <option value="mtp">mtp (啟用 MTP 投機加速 - 官方推薦)</option>
+                  <option value="off">off (關閉投機，僅使用單步自回歸解碼)</option>
                 </select>
-                {form.mtp_policy === 'survival' && form.temperature <= 0 && (
-                  <div style={hintStyle}>
-                    survival 只在 temperature &gt; 0 時生效；temperature = 0 (貪婪解碼) 時此選項沒有差別。
-                  </div>
-                )}
+                <div style={hintStyle}>
+                  官方 <code>gufo-org/gufo</code> 在啟用 MTP 時已內建動態草稿長度控制、最長 64-token Prompt Lookup 與分層 Prefill 排程，無須手動調整舊版實驗參數。
+                </div>
               </div>
 
               {/* 預設思考模式 */}
@@ -615,77 +612,6 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                   onChange={(e) => handleChange('max_tokens', clampInt(e.target.value, 0))}
                 />
                 <div style={hintStyle}>請求未帶 max_tokens 時的上限；0 = 交給 Gufo 預設 (直到 EOS 或 context 用盡)。</div>
-              </div>
-
-              {/* MTP 草稿長度 */}
-              <div className="form-group">
-                <div className="form-label">
-                  <span>MTP 草稿長度 (--draft-tokens)</span>
-                </div>
-                <input
-                  type="number"
-                  className="form-input"
-                  min={0}
-                  max={16}
-                  value={form.draft_tokens}
-                  disabled={isRunning}
-                  onChange={(e) => handleChange('draft_tokens', clampInt(e.target.value, 0, 16))}
-                />
-                <div style={hintStyle}>0 = Gufo 預設。草稿越長，接受率低時浪費越多運算。</div>
-              </div>
-
-              {/* MTP 草稿詞表 */}
-              <div className="form-group">
-                <div className="form-label">
-                  <span>MTP 草稿詞表 (--mtp-draft-vocab)</span>
-                </div>
-                <select
-                  className="form-input"
-                  value={form.mtp_draft_vocab}
-                  disabled={isRunning}
-                  onChange={(e) => handleChange('mtp_draft_vocab', e.target.value)}
-                >
-                  <option value="full">full (完整詞表，中文推薦)</option>
-                  <option value="latin">latin (僅拉丁字元，英文/程式碼較快)</option>
-                </select>
-                {form.mtp_draft_vocab === 'latin' && (
-                  <div style={{ ...hintStyle, color: '#f59e0b' }}>
-                    latin 詞表無法草擬中文 token，輸出中文時 MTP 接受率會明顯下降。
-                  </div>
-                )}
-              </div>
-
-              {/* Prefill 分塊 */}
-              <div className="form-group">
-                <div className="form-label">
-                  <span>Prefill 分塊大小 (--prefill-chunk)</span>
-                </div>
-                <input
-                  type="number"
-                  className="form-input"
-                  min={0}
-                  step={256}
-                  value={form.prefill_chunk}
-                  disabled={isRunning}
-                  onChange={(e) => handleChange('prefill_chunk', clampInt(e.target.value, 0))}
-                />
-                <div style={hintStyle}>0 = Gufo 預設。較小值可降低並發時其他會話的延遲，但 prefill 吞吐會下降。</div>
-              </div>
-
-              {/* Prompt Lookup */}
-              <div className="form-group">
-                <div className="form-label">
-                  <span>Prompt Lookup 投機 (--prompt-lookup)</span>
-                </div>
-                <label style={checkboxLabelStyle}>
-                  <input
-                    type="checkbox"
-                    checked={form.prompt_lookup}
-                    disabled={isRunning}
-                    onChange={(e) => handleChange('prompt_lookup', e.target.checked)}
-                  />
-                  <span>從輸入內容比對草稿 (改寫、程式碼編輯等重複性高的任務有效)</span>
-                </label>
               </div>
 
               {/* 磁碟 Prompt 快取 */}
@@ -794,7 +720,12 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                   )}
                 </div>
                 <div style={{ fontSize: 11.5, color: '#64748b', marginTop: 2 }}>
-                  若設定 API Key，外部或本地客戶端（如 Open WebUI, Cursor, VS Code 等）向 <code>{status.endpoint}</code>{form.https_enabled ? ` 或 https://127.0.0.1:${form.https_port}/v1` : ''} 發出請求時，皆必須攜帶 <code>Authorization: Bearer &lt;KEY&gt;</code> 標頭。
+                  官方 <code>gufo-org/gufo</code> 已移除原生的 <code>--api-key</code> 參數，改由前置反向代理負責認證。設定 API Key 後，Gufo Studio 內建的 <strong>HTTPS (TLS) 反向代理</strong>（Port <code>{form.https_port}</code>）會強制驗證 <code>Authorization: Bearer &lt;KEY&gt;</code> 標頭；底層 HTTP 端點（<code>{status.endpoint}</code>）維持直連不檢查金鑰。
+                  {form.api_key && !form.https_enabled && (
+                    <span style={{ color: '#f59e0b', display: 'block', marginTop: 4 }}>
+                      ⚠️ 目前未啟用內建 HTTPS 代理，API Key 驗證暫時不會生效。
+                    </span>
+                  )}
                 </div>
               </div>
 
