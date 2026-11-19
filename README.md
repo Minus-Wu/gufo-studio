@@ -2,7 +2,7 @@
 
 **Gufo Studio** 是專為高效能本地推論引擎 [pixmaate/gufo](https://github.com/pixmaate/gufo)（針對 AMD Strix Halo / Ryzen AI MAX+ 395 / `gfx1151` 架構優化）打造的原生圖形介面包裝器（Desktop Wrapper）。
 
-本專案提供輕量直覺的系統匣常駐圖示（System Tray）與現代化對話介面（Chat UI），並以本機 `12223` 埠號提供 OpenAI 相容 API 服務，讓使用者無需繁瑣的命令列即可享受極速本地推論。
+本專案提供輕量直覺的系統匣常駐圖示（System Tray）與現代化對話介面（Chat UI），預設綁定 `0.0.0.0` 以 HTTP (`12223`) 與內建 HTTPS (`12443`) 雙協定提供 OpenAI 相容 API 服務，讓使用者無需繁瑣的命令列即可享受極速本地與區域網路推論。
 
 ---
 
@@ -33,9 +33,10 @@
      - 視覺側車側載（`--mmproj mmproj-BF16.gguf`）
      - 零採樣貪婪解碼（`--temperature 0 --think off`）
 
-4. **API Key 安全金鑰保護 (Authorization Bearer Token)**：
-   - 支援原生 `--api-key <KEY>` 伺服器安全機制。
-   - 提供圖形化密碼顯示/隱藏切換、隨機高強度金鑰生成（`sk-gufo-...`）。
+4. **網路綁定、HTTPS 加密代理與 API Key 保護**：
+   - 預設綁定 `0.0.0.0`（可於「配置」頁切換為 `127.0.0.1` 僅限本機）。
+   - 內建 TLS 反向代理（預設 Port `12443`）：未指定自訂憑證時會自動產生並保存自簽憑證（`gufo-studio.cert.pem` / `gufo-studio.key.pem`），亦支援載入自訂 PEM 憑證與私鑰。
+   - 支援原生 `--api-key <KEY>` 伺服器安全機制，提供圖形化密碼顯示/隱藏切換與隨機金鑰生成（`sk-gufo-...`）。
    - 保障區域網路（LAN）或本機服務存取安全，內建 Chat 介面與健康檢查探測自動附加金鑰。
 
 5. **即時日誌流與狀態儀表板 (Live Logs & Dashboard)**：
@@ -86,20 +87,20 @@ Gufo README 的峰值數據（例如 prefill ≈ 1600 tok/s、單路 decode ≈ 
 ## 🚀 開發與建置
 
 ### 必備環境
-- Node.js 20+ & pnpm
+- Node.js 20+ & npm
 - Rust 1.80+ (MSVC 工具鏈)
 - Windows 10/11 64-bit
 
 ### 啟動開發伺服器
 ```powershell
-pnpm install
-pnpm tauri dev
+npm install
+npm run tauri dev
 ```
 
 ### 建置單一執行檔便攜版 (Standalone Portable EXE)
 本專案支援將前端 Web 介面完整靜態內嵌至單一二進制檔案中，免安裝即可直接執行：
 ```powershell
-pnpm build:portable
+npm run build:portable
 ```
 打包完成後將直接產出 `dist-portable/gufo-studio.exe`：
 - **隨處可跑**：可直接將 `gufo-studio.exe` 拷貝放置於 Gufo 的 Release 資料夾（例如與 `gufo.exe` 同目錄）。
@@ -108,7 +109,7 @@ pnpm build:portable
 
 ### 建置正式發行安裝包
 ```powershell
-pnpm tauri build
+npm run tauri build
 ```
 
 ---
