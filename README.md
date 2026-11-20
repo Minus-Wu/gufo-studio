@@ -36,6 +36,7 @@
    - 預設綁定 `0.0.0.0`（可於「配置」頁切換為 `127.0.0.1` 僅限本機）。
    - 內建 TLS 反向代理（預設 Port `12443`）：未指定自訂憑證時會自動產生並保存自簽憑證（`gufo-studio.cert.pem` / `gufo-studio.key.pem`），亦支援載入自訂 PEM 憑證與私鑰。
    - 配合官方 `gufo-org/gufo` 將認證交由前置代理的設計，當設定 API Key（支援圖形化密碼顯示/隱藏與隨機生成 `sk-gufo-...`）時，由內建 HTTPS 反向代理強制驗證 `Authorization: Bearer <KEY>`；底層 HTTP 維持原生直連。
+   - 內建 HTTPS 代理亦會針對 `POST /v1/chat/completions` 串流請求自動補齊 `stream_options.include_usage: true`（若使用端未指定），並於回應自動補齊 OpenAI 相容的 `usage.prompt_tokens_details.cache_write_tokens`、`usage.cache_write_tokens` 與 `usage.cache_creation_input_tokens`，確保 API 統計端能正確記錄快取寫入量與 token details。
 
 5. **即時日誌流與狀態儀表板 (Live Logs & Dashboard)**：
    - 即時捕捉 Gufo 的 stdout / stderr。
