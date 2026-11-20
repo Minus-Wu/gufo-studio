@@ -59,7 +59,7 @@ export function App() {
     draft_tokens: 0,
     mtp_draft_vocab: 'full',
     prefill_chunk: 0,
-    cache_disk: false,
+    cache_disk: true,
     cache_disk_dir: 'gufo-cache',
     cache_disk_bytes: 0,
     https_enabled: true,

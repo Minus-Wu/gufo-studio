@@ -127,7 +127,7 @@ impl Default for GufoServerConfig {
             draft_tokens: 0,
             mtp_draft_vocab: "full".to_string(),
             prefill_chunk: 0,
-            cache_disk: false,
+            cache_disk: true,
             cache_disk_dir: "gufo-cache".to_string(),
             cache_disk_bytes: 0,
             https_enabled: true,
@@ -1305,7 +1305,7 @@ mod tests {
         assert!(!config.auto_start_server);
         assert_eq!(config.max_tokens, 32768);
         assert_eq!(config.mtp_draft_vocab, "full");
-        assert!(!config.cache_disk);
+        assert!(config.cache_disk);
 
         // 預設路徑應為相對工作目錄，不應寫死 D:\Agents 或 D:\Models
         assert!(!config.gufo_path.starts_with(r"D:\Agents\gufo"));
@@ -1323,6 +1323,7 @@ mod tests {
         assert_eq!(cfg.think, "on");
         assert!(cfg.auto_open_gui);
         assert_eq!(cfg.max_tokens, 32768);
+        assert!(cfg.cache_disk);
         assert_eq!(cfg.cache_disk_dir, "gufo-cache");
         assert!(cfg.https_enabled);
         assert_eq!(cfg.https_port, 12443);

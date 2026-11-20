@@ -43,7 +43,7 @@
 
 6. **可調整的進階推論參數**：
    - `--max-tokens`（預設生成上限）、`--speculative`（`mtp` / `off`）、預設 `--temperature`、`--think`。
-   - 磁碟 Prompt 快取：`--cache-disk <DIR>` 與 `--cache-disk-bytes`。
+   - 磁碟 Prompt 快取：預設開啟 `--cache-disk <DIR>`（預設目錄 `gufo-cache`）與 `--cache-disk-bytes`。
    - 數值為 0 表示不傳該參數、交給 Gufo 預設值。
 
 ---
