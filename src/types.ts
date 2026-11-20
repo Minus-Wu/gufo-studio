@@ -97,6 +97,9 @@ export interface ChatMessage {
   excludeFromContext?: boolean;
   isError?: boolean;
   metrics?: ChatMetrics;
+  ragHits?: RagSearchHit[];
+  ragWarning?: string;
+  ragElapsedMs?: number;
 }
 
 export interface ChatSession {
@@ -142,4 +145,103 @@ export interface InferenceMetrics {
   lookup_accepted?: number;
   lookup_proposed?: number;
   timestamp: number;
+}
+
+export interface RagConfig {
+  chunk_size: number;
+  chunk_overlap: number;
+  top_k: number;
+  min_score: number;
+  embedding_enabled: boolean;
+  embedding_endpoint: string;
+  embedding_model: string;
+  embedding_api_key: string;
+  hybrid_alpha: number;
+  system_prompt_template: string;
+}
+
+export interface KnowledgeBaseSummary {
+  id: string;
+  name: string;
+  description: string;
+  created_at: number;
+  updated_at: number;
+  doc_count: number;
+  chunk_count: number;
+  embedded_chunk_count: number;
+  embedding_model_tag: string | null;
+}
+
+export interface RagDocument {
+  id: string;
+  name: string;
+  source_path: string;
+  file_type: string;
+  char_count: number;
+  chunk_count: number;
+  embedded_chunk_count: number;
+  added_at: number;
+}
+
+export interface KnowledgeBaseDetail {
+  summary: KnowledgeBaseSummary;
+  documents: RagDocument[];
+}
+
+export interface RagChunkPreview {
+  id: string;
+  chunk_index: number;
+  content: string;
+  char_count: number;
+  has_embedding: boolean;
+}
+
+export interface RagImportItemError {
+  file: string;
+  reason: string;
+}
+
+export interface RagImportResult {
+  imported_docs: number;
+  replaced_docs: number;
+  added_chunks: number;
+  embedded_chunks: number;
+  skipped_files: number;
+  errors: RagImportItemError[];
+  embedding_warning: string | null;
+}
+
+export interface RagReindexResult {
+  total_chunks: number;
+  embedded_chunks: number;
+  embedding_model_tag: string | null;
+}
+
+export interface EmbeddingTestResult {
+  ok: boolean;
+  endpoint_url: string;
+  model: string;
+  dimension: number;
+  latency_ms: number;
+}
+
+export interface RagSearchHit {
+  chunk_id: string;
+  kb_id: string;
+  kb_name: string;
+  doc_id: string;
+  doc_name: string;
+  chunk_index: number;
+  content: string;
+  score: number;
+  bm25_score: number;
+  vector_score: number | null;
+  match_mode: 'hybrid' | 'bm25' | string;
+}
+
+export interface RagSearchResponse {
+  hits: RagSearchHit[];
+  used_embedding: boolean;
+  warning: string | null;
+  elapsed_ms: number;
 }

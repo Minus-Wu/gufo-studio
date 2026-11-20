@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
@@ -13,8 +14,21 @@ import {
   Zap,
   Clock,
   X,
+  BookOpen,
+  ChevronDown,
+  ChevronUp,
+  AlertCircle,
 } from 'lucide-react';
-import { ChatMessage, ChatMetrics, MessageImage, ServerStatus } from '../types';
+import {
+  ChatMessage,
+  ChatMetrics,
+  KnowledgeBaseSummary,
+  MessageImage,
+  RagConfig,
+  RagSearchHit,
+  RagSearchResponse,
+  ServerStatus,
+} from '../types';
 import { describeCacheMissReason, formatCacheSourceLabel } from '../utils/metricsFormat';
 
 interface ChatViewProps {
@@ -23,6 +37,13 @@ interface ChatViewProps {
   defaultThink?: boolean;
   /** 對話預設採樣溫度 (來自伺服器設定的 --temperature) */
   defaultTemperature?: number;
+  kbList: KnowledgeBaseSummary[];
+  ragConfig: RagConfig;
+  ragEnabled: boolean;
+  onToggleRag: (enabled: boolean) => void;
+  selectedKbIds: string[];
+  onToggleKbId: (id: string) => void;
+  onOpenRagTab: () => void;
 }
 
 const round1 = (n: number) => Math.round(n * 10) / 10;
@@ -85,13 +106,20 @@ export const ChatView: React.FC<ChatViewProps> = ({
   status,
   defaultThink = false,
   defaultTemperature = 0,
+  kbList,
+  ragConfig,
+  ragEnabled,
+  onToggleRag,
+  selectedKbIds,
+  onToggleKbId,
+  onOpenRagTab,
 }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: 'welcome',
       role: 'assistant',
       content:
-        '你好！我是 **Gufo Studio**，本機以 AMD Strix Halo (Ryzen AI MAX+ 395) 硬體深度優化推論。\n\n目前預設支援 **Qwen3.8-Flash-Next (128K Vision)** 投機加速推論。你可以隨時傳送訊息、貼上圖片截圖，或是使用上方控制列調整思考模式！',
+        '你好！我是 **Gufo Studio**，本機以 AMD Strix Halo (Ryzen AI MAX+ 395) 硬體深度優化推論。\n\n目前預設支援 **Qwen3.8-Flash-Next (128K Vision)** 投機加速推論。你可以隨時傳送訊息、貼上圖片截圖，或是切換上方「知識庫 (RAG)」掛載本地文件進行問答！',
       timestamp: Date.now(),
       excludeFromContext: true,
     },
@@ -103,6 +131,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
   const [thinkMode, setThinkMode] = useState(defaultThink);
   const [temperature, setTemperature] = useState(defaultTemperature);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [expandedCitations, setExpandedCitations] = useState<Record<string, boolean>>({});
 
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -182,10 +211,11 @@ export const ChatView: React.FC<ChatViewProps> = ({
     }
 
     const userMessageId = `msg-${Date.now()}`;
+    const trimmedInput = input.trim();
     const userMessage: ChatMessage = {
       id: userMessageId,
       role: 'user',
-      content: input.trim(),
+      content: trimmedInput,
       images: images.length > 0 ? [...images] : undefined,
       timestamp: Date.now(),
     };
@@ -196,17 +226,56 @@ export const ChatView: React.FC<ChatViewProps> = ({
     setImages([]);
     setIsGenerating(true);
 
+    let ragHits: RagSearchHit[] = [];
+    let ragWarning: string | undefined;
+    let ragElapsedMs: number | undefined;
+    let augmentedUserText = trimmedInput;
+
+    if (ragEnabled && selectedKbIds.length > 0 && trimmedInput.length > 0) {
+      try {
+        const searchRes = await invoke<RagSearchResponse>('rag_search', {
+          kbIds: selectedKbIds,
+          query: trimmedInput,
+        });
+        ragHits = searchRes.hits || [];
+        ragWarning = searchRes.warning || undefined;
+        ragElapsedMs = searchRes.elapsed_ms;
+
+        if (ragHits.length > 0) {
+          const contextBlock = ragHits
+            .map(
+              (h, idx) =>
+                `[${idx + 1}] 來源：${h.doc_name}（知識庫：${h.kb_name}，切片 #${
+                  h.chunk_index + 1
+                }）\n${h.content}`
+            )
+            .join('\n\n---\n\n');
+          const tpl = ragConfig.system_prompt_template || '{{context}}';
+          const ragInstruction = tpl.includes('{{context}}')
+            ? tpl.replace('{{context}}', contextBlock)
+            : `${tpl}\n\n${contextBlock}`;
+          augmentedUserText = `${ragInstruction}\n\n【使用者問題】\n${trimmedInput}`;
+        }
+      } catch (err: any) {
+        ragWarning = `知識庫檢索失敗，本次改以原始問題送出：${err}`;
+      }
+    }
+
     const assistantMsgId = `asst-${Date.now()}`;
     const assistantMessage: ChatMessage = {
       id: assistantMsgId,
       role: 'assistant',
       content: '',
       timestamp: Date.now(),
+      ragHits: ragHits.length > 0 ? ragHits : undefined,
+      ragWarning,
+      ragElapsedMs,
     };
 
     setMessages([...newMessages, assistantMessage]);
 
     // 格式化 OpenAI 對話歷史 (排除歡迎訊息、錯誤提示與空白回覆)
+    // 注意：僅對本次最新使用者訊息附加 RAG 檢索片段，既相容各種 chat template，也完整保留前面輪次的 KV 前綴快取
     const apiMessages = newMessages
       .filter(
         (msg) =>
@@ -214,10 +283,11 @@ export const ChatView: React.FC<ChatViewProps> = ({
           !(msg.role === 'assistant' && !msg.content.trim())
       )
       .map((msg) => {
+        const effectiveText = msg.id === userMessageId ? augmentedUserText : msg.content;
         if (msg.images && msg.images.length > 0) {
           const contentParts: any[] = [];
-          if (msg.content) {
-            contentParts.push({ type: 'text', text: msg.content });
+          if (effectiveText) {
+            contentParts.push({ type: 'text', text: effectiveText });
           }
           for (const img of msg.images) {
             contentParts.push({
@@ -230,7 +300,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
         if (msg.role === 'assistant' && msg.reasoning) {
           return { role: msg.role, content: msg.content, reasoning_content: msg.reasoning };
         }
-        return { role: msg.role, content: msg.content };
+        return { role: msg.role, content: effectiveText };
       });
 
     const abortController = new AbortController();
@@ -551,6 +621,64 @@ export const ChatView: React.FC<ChatViewProps> = ({
               </div>
 
               <div className={`message-bubble ${msg.role === 'user' ? 'user-bubble' : ''}`}>
+                {/* RAG 檢索來源折疊區塊 */}
+                {(msg.ragHits?.length || msg.ragWarning) && (
+                  <div className="rag-citation-box">
+                    <button
+                      type="button"
+                      className="rag-citation-toggle"
+                      onClick={() =>
+                        setExpandedCitations((prev) => ({
+                          ...prev,
+                          [msg.id]: !prev[msg.id],
+                        }))
+                      }
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <BookOpen size={13} color="#38bdf8" />
+                        <span>
+                          {msg.ragHits && msg.ragHits.length > 0
+                            ? `已引用 ${msg.ragHits.length} 筆知識庫片段${
+                                msg.ragElapsedMs !== undefined ? ` (${msg.ragElapsedMs}ms)` : ''
+                              }`
+                            : '知識庫檢索提示'}
+                        </span>
+                      </div>
+                      {expandedCitations[msg.id] ? (
+                        <ChevronUp size={14} />
+                      ) : (
+                        <ChevronDown size={14} />
+                      )}
+                    </button>
+
+                    {msg.ragWarning && (
+                      <div className="rag-citation-warn">
+                        <AlertCircle size={12} />
+                        <span>{msg.ragWarning}</span>
+                      </div>
+                    )}
+
+                    {expandedCitations[msg.id] && msg.ragHits && (
+                      <div className="rag-citation-list">
+                        {msg.ragHits.map((hit, idx) => (
+                          <div key={hit.chunk_id} className="rag-citation-item">
+                            <div className="rag-citation-item-head">
+                              <span>
+                                [{idx + 1}] {hit.doc_name} · {hit.kb_name} (#{hit.chunk_index + 1})
+                              </span>
+                              <span className="rag-citation-score">
+                                {hit.match_mode === 'hybrid' ? '混合' : 'BM25'}{' '}
+                                {(hit.score * 100).toFixed(0)}%
+                              </span>
+                            </div>
+                            <div className="rag-citation-snippet">{hit.content}</div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {/* 思考鏈展開區 */}
                 {msg.reasoning && (
                   <div className="reasoning-box">
@@ -590,6 +718,46 @@ export const ChatView: React.FC<ChatViewProps> = ({
 
       {/* 輸入區塊 */}
       <div className="chat-input-container">
+        {/* RAG 知識庫選擇條 */}
+        {ragEnabled && (
+          <div className="chat-rag-bar">
+            <span className="chat-rag-label">
+              <BookOpen size={12} color="#38bdf8" />
+              <span>掛載知識庫：</span>
+            </span>
+            {kbList.length === 0 ? (
+              <button
+                type="button"
+                className="chat-rag-link"
+                onClick={onOpenRagTab}
+              >
+                尚無知識庫，點擊前往「知識庫 (RAG)」建立 →
+              </button>
+            ) : (
+              <div className="chat-rag-pills">
+                {kbList.map((kb) => {
+                  const active = selectedKbIds.includes(kb.id);
+                  return (
+                    <button
+                      key={kb.id}
+                      type="button"
+                      className={`chat-rag-pill ${active ? 'active' : ''}`}
+                      onClick={() => onToggleKbId(kb.id)}
+                      title={`${kb.doc_count} 份文件 · ${kb.chunk_count} 個切片`}
+                    >
+                      <span>{kb.name}</span>
+                      <span className="chat-rag-count">{kb.chunk_count}</span>
+                    </button>
+                  );
+                })}
+                <button type="button" className="chat-rag-link" onClick={onOpenRagTab}>
+                  管理
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* 圖片預覽條 */}
         {images.length > 0 && (
           <div className="image-preview-strip">
@@ -607,6 +775,20 @@ export const ChatView: React.FC<ChatViewProps> = ({
         {/* 控制列 */}
         <div className="chat-input-controls">
           <div className="controls-left">
+            <button
+              className={`toggle-btn ${ragEnabled ? 'active-rag' : ''}`}
+              onClick={() => onToggleRag(!ragEnabled)}
+              title="開啟後，發問時會先檢索勾選的本地知識庫並附上出處"
+            >
+              <BookOpen size={14} />
+              <span>
+                知識庫 (RAG)：
+                {ragEnabled
+                  ? `開啟 (${selectedKbIds.length}/${kbList.length})`
+                  : '關閉'}
+              </span>
+            </button>
+
             <button
               className={`toggle-btn ${thinkMode ? 'active' : ''}`}
               onClick={() => setThinkMode(!thinkMode)}

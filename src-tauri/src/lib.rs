@@ -2,10 +2,12 @@ mod commands;
 pub mod gufo_manager;
 pub mod https_proxy;
 mod process_control;
+pub mod rag;
 mod tray;
 pub mod window_state;
 
 use gufo_manager::GufoManager;
+use rag::RagManager;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{Manager, WindowEvent};
@@ -15,17 +17,20 @@ const WINDOW_STATE_SAVE_DEBOUNCE_MS: u64 = 500;
 
 pub struct AppState {
     pub manager: Arc<GufoManager>,
+    pub rag: Arc<RagManager>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let manager = Arc::new(GufoManager::new());
+    let rag = Arc::new(RagManager::new());
     let manager_for_exit = manager.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             manager: manager.clone(),
+            rag,
         })
         .setup(|app| {
             let initial_config = gufo_manager::GufoManager::load_saved_config().unwrap_or_default();
@@ -108,6 +113,22 @@ pub fn run() {
             commands::get_recent_metrics,
             commands::check_path_exists,
             commands::select_file,
+            commands::rag_get_config,
+            commands::rag_save_config,
+            commands::rag_test_embedding,
+            commands::rag_list_kbs,
+            commands::rag_get_kb,
+            commands::rag_create_kb,
+            commands::rag_delete_kb,
+            commands::rag_pick_files,
+            commands::rag_pick_folder,
+            commands::rag_add_files,
+            commands::rag_add_folder,
+            commands::rag_add_text,
+            commands::rag_get_doc_chunks,
+            commands::rag_delete_document,
+            commands::rag_reindex_kb,
+            commands::rag_search,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

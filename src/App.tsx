@@ -5,16 +5,42 @@ import './styles.css';
 
 import { Header } from './components/Header';
 import { ChatView } from './components/ChatView';
+import { RagView } from './components/RagView';
 import { ConfigView } from './components/ConfigView';
 import { LogsView } from './components/LogsView';
-import { ActiveInferenceRequest, GufoServerConfig, InferenceMetrics, ServerStatus } from './types';
+import {
+  ActiveInferenceRequest,
+  GufoServerConfig,
+  InferenceMetrics,
+  KnowledgeBaseSummary,
+  RagConfig,
+  ServerStatus,
+} from './types';
 
 export function App() {
-  const [activeTab, setActiveTab] = useState<'chat' | 'config' | 'logs'>('chat');
+  const [activeTab, setActiveTab] = useState<'chat' | 'rag' | 'config' | 'logs'>('chat');
   const [isStarting, setIsStarting] = useState(false);
   const [metricsHistory, setMetricsHistory] = useState<InferenceMetrics[]>([]);
   const [activeRequest, setActiveRequest] = useState<ActiveInferenceRequest | null>(null);
   const latestMetrics = metricsHistory.length > 0 ? metricsHistory[metricsHistory.length - 1] : null;
+
+  // RAG 狀態
+  const [kbList, setKbList] = useState<KnowledgeBaseSummary[]>([]);
+  const [ragEnabled, setRagEnabled] = useState(false);
+  const [selectedKbIds, setSelectedKbIds] = useState<string[]>([]);
+  const [ragConfig, setRagConfig] = useState<RagConfig>({
+    chunk_size: 800,
+    chunk_overlap: 120,
+    top_k: 5,
+    min_score: 0.05,
+    embedding_enabled: false,
+    embedding_endpoint: 'http://127.0.0.1:12224/v1',
+    embedding_model: '',
+    embedding_api_key: '',
+    hybrid_alpha: 0.6,
+    system_prompt_template:
+      '請優先依據以下「檢索參考資料」回答使用者的問題。回答時若引用了資料內容，請以 [來源編號]（例如 [1]、[2]）標註出處；若參考資料不足以回答或與問題無關，請誠實說明，不要編造事實。\n\n【檢索參考資料】\n{{context}}',
+  });
 
   const [status, setStatus] = useState<ServerStatus>({
     state: 'stopped',
@@ -107,6 +133,16 @@ export function App() {
         const recentMetrics = await invoke<InferenceMetrics[]>('get_recent_metrics');
         if (recentMetrics && recentMetrics.length > 0) {
           setMetricsHistory(recentMetrics);
+        }
+
+        const [loadedRagCfg, loadedKbs] = await Promise.all([
+          invoke<RagConfig>('rag_get_config'),
+          invoke<KnowledgeBaseSummary[]>('rag_list_kbs'),
+        ]);
+        setRagConfig(loadedRagCfg);
+        setKbList(loadedKbs);
+        if (loadedKbs.length > 0) {
+          setSelectedKbIds(loadedKbs.map((k) => k.id));
         }
       } catch (err) {
         console.error('初始化失敗:', err);
@@ -222,6 +258,34 @@ export function App() {
     }
   };
 
+  // 重新載入 RAG 知識庫列表，並保留有效選取（新建立的知識庫自動選取）
+  const refreshRagKbs = async () => {
+    try {
+      const list = await invoke<KnowledgeBaseSummary[]>('rag_list_kbs');
+      const prevIds = new Set(kbList.map((k) => k.id));
+      const validSet = new Set(list.map((k) => k.id));
+      const newlyAdded = list.filter((k) => !prevIds.has(k.id)).map((k) => k.id);
+      setKbList(list);
+      setSelectedKbIds((prevSel) => {
+        const kept = prevSel.filter((id) => validSet.has(id));
+        return Array.from(new Set([...kept, ...newlyAdded]));
+      });
+    } catch (err) {
+      console.error('載入知識庫列表失敗:', err);
+    }
+  };
+
+  const handleSaveRagConfig = async (newCfg: RagConfig) => {
+    const saved = await invoke<RagConfig>('rag_save_config', { config: newCfg });
+    setRagConfig(saved);
+  };
+
+  const handleToggleKbId = (id: string) => {
+    setSelectedKbIds((prev) =>
+      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
+    );
+  };
+
   return (
     <>
       <Header
@@ -236,11 +300,33 @@ export function App() {
       />
 
       <main className="app-body">
-        {activeTab === 'chat' && (
+        <div
+          style={{
+            display: activeTab === 'chat' ? 'flex' : 'none',
+            flex: 1,
+            minWidth: 0,
+            height: '100%',
+          }}
+        >
           <ChatView
             status={status}
             defaultThink={config.think === 'on'}
             defaultTemperature={config.temperature}
+            kbList={kbList}
+            ragConfig={ragConfig}
+            ragEnabled={ragEnabled}
+            onToggleRag={setRagEnabled}
+            selectedKbIds={selectedKbIds}
+            onToggleKbId={handleToggleKbId}
+            onOpenRagTab={() => setActiveTab('rag')}
+          />
+        </div>
+        {activeTab === 'rag' && (
+          <RagView
+            kbList={kbList}
+            ragConfig={ragConfig}
+            onKbsChanged={refreshRagKbs}
+            onSaveConfig={handleSaveRagConfig}
           />
         )}
         {activeTab === 'config' && (

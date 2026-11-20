@@ -14,6 +14,7 @@ import {
   Activity,
   Database,
   Loader2,
+  BookOpen,
 } from 'lucide-react';
 import { ActiveInferenceRequest, InferenceMetrics, ServerStatus } from '../types';
 import {
@@ -24,8 +25,8 @@ import {
 } from '../utils/metricsFormat';
 
 interface HeaderProps {
-  activeTab: 'chat' | 'config' | 'logs';
-  setActiveTab: (tab: 'chat' | 'config' | 'logs') => void;
+  activeTab: 'chat' | 'rag' | 'config' | 'logs';
+  setActiveTab: (tab: 'chat' | 'rag' | 'config' | 'logs') => void;
   status: ServerStatus;
   latestMetrics?: InferenceMetrics | null;
   activeRequest?: ActiveInferenceRequest | null;
@@ -140,6 +141,15 @@ export const Header: React.FC<HeaderProps> = ({
           <MessageSquare size={16} />
           <span>
             對話<span className="tab-en"> (Chat)</span>
+          </span>
+        </button>
+        <button
+          className={`nav-tab-btn ${activeTab === 'rag' ? 'active' : ''}`}
+          onClick={() => setActiveTab('rag')}
+        >
+          <BookOpen size={16} />
+          <span>
+            知識庫<span className="tab-en"> (RAG)</span>
           </span>
         </button>
         <button

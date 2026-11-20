@@ -1,4 +1,8 @@
 use crate::gufo_manager::{GufoManager, GufoServerConfig, InferenceMetrics, ServerStatus};
+use crate::rag::{
+    EmbeddingTestResult, KnowledgeBaseDetail, KnowledgeBaseSummary, RagChunkPreview, RagConfig,
+    RagImportResult, RagReindexResult, RagSearchResponse,
+};
 use crate::AppState;
 use tauri::{AppHandle, State};
 
@@ -150,4 +154,162 @@ pub async fn select_file(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+// ── RAG 知識庫與檢索指令 ──
+
+#[tauri::command]
+pub async fn rag_get_config(state: State<'_, AppState>) -> Result<RagConfig, String> {
+    Ok(state.rag.get_config().await)
+}
+
+#[tauri::command]
+pub async fn rag_save_config(
+    state: State<'_, AppState>,
+    config: RagConfig,
+) -> Result<RagConfig, String> {
+    state.rag.save_config(config).await
+}
+
+#[tauri::command]
+pub async fn rag_test_embedding(
+    state: State<'_, AppState>,
+    config: RagConfig,
+) -> Result<EmbeddingTestResult, String> {
+    state.rag.test_embedding(config).await
+}
+
+#[tauri::command]
+pub async fn rag_list_kbs(
+    state: State<'_, AppState>,
+) -> Result<Vec<KnowledgeBaseSummary>, String> {
+    Ok(state.rag.list_kbs().await)
+}
+
+#[tauri::command]
+pub async fn rag_get_kb(
+    state: State<'_, AppState>,
+    kb_id: String,
+) -> Result<KnowledgeBaseDetail, String> {
+    state.rag.get_kb(&kb_id).await
+}
+
+#[tauri::command]
+pub async fn rag_create_kb(
+    state: State<'_, AppState>,
+    name: String,
+    description: String,
+) -> Result<KnowledgeBaseSummary, String> {
+    state.rag.create_kb(name, description).await
+}
+
+#[tauri::command]
+pub async fn rag_delete_kb(state: State<'_, AppState>, kb_id: String) -> Result<(), String> {
+    state.rag.delete_kb(&kb_id).await
+}
+
+#[tauri::command]
+pub async fn rag_pick_files() -> Result<Vec<String>, String> {
+    tokio::task::spawn_blocking(|| {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("選取要匯入知識庫的文字或程式碼檔案")
+            .add_filter(
+                "純文字與程式碼文件",
+                &[
+                    "txt", "md", "markdown", "json", "jsonl", "csv", "tsv", "yaml", "yml", "toml",
+                    "xml", "html", "css", "js", "jsx", "ts", "tsx", "rs", "py", "go", "java",
+                    "c", "cpp", "h", "hpp", "cs", "sh", "ps1", "sql", "log",
+                ],
+            )
+            .add_filter("所有檔案", &["*"]);
+        if let Ok(cwd) = std::env::current_dir() {
+            dialog = dialog.set_directory(&cwd);
+        }
+        let picked = dialog.pick_files().unwrap_or_default();
+        Ok(picked
+            .into_iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn rag_pick_folder() -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(|| {
+        let mut dialog = rfd::FileDialog::new().set_title("選取要批次匯入知識庫的資料夾");
+        if let Ok(cwd) = std::env::current_dir() {
+            dialog = dialog.set_directory(&cwd);
+        }
+        Ok(dialog
+            .pick_folder()
+            .map(|p| p.to_string_lossy().to_string()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn rag_add_files(
+    state: State<'_, AppState>,
+    kb_id: String,
+    file_paths: Vec<String>,
+) -> Result<RagImportResult, String> {
+    state.rag.add_files(&kb_id, file_paths).await
+}
+
+#[tauri::command]
+pub async fn rag_add_folder(
+    state: State<'_, AppState>,
+    kb_id: String,
+    folder_path: String,
+) -> Result<RagImportResult, String> {
+    state.rag.add_folder(&kb_id, folder_path).await
+}
+
+#[tauri::command]
+pub async fn rag_add_text(
+    state: State<'_, AppState>,
+    kb_id: String,
+    title: String,
+    content: String,
+) -> Result<RagImportResult, String> {
+    state.rag.add_text(&kb_id, title, content).await
+}
+
+#[tauri::command]
+pub async fn rag_get_doc_chunks(
+    state: State<'_, AppState>,
+    kb_id: String,
+    doc_id: String,
+) -> Result<Vec<RagChunkPreview>, String> {
+    state.rag.get_doc_chunks(&kb_id, &doc_id).await
+}
+
+#[tauri::command]
+pub async fn rag_delete_document(
+    state: State<'_, AppState>,
+    kb_id: String,
+    doc_id: String,
+) -> Result<(), String> {
+    state.rag.delete_document(&kb_id, &doc_id).await
+}
+
+#[tauri::command]
+pub async fn rag_reindex_kb(
+    state: State<'_, AppState>,
+    kb_id: String,
+) -> Result<RagReindexResult, String> {
+    state.rag.reindex_kb(&kb_id).await
+}
+
+#[tauri::command]
+pub async fn rag_search(
+    state: State<'_, AppState>,
+    kb_ids: Vec<String>,
+    query: String,
+    top_k: Option<u32>,
+) -> Result<RagSearchResponse, String> {
+    state.rag.search(kb_ids, query, top_k).await
 }
