@@ -1,11 +1,13 @@
 export type ServerState = 'stopped' | 'starting' | 'running' | 'error';
 
+export type ModelFamily = 'qwen3.8-flash-next' | 'inkling-2-mini' | 'custom';
 export type YarnMode = 'auto' | 'on' | 'off';
 export type SpeculativeMode = 'mtp' | 'dspark' | 'dflash2' | 'off';
 
 export interface ModelProfile {
   id: string;
   name: string;
+  model_family: ModelFamily;
   model_path: string;
   mtp_path: string;
   dspark_path: string;
@@ -23,6 +25,7 @@ export interface ModelProfile {
 
 export interface GufoServerConfig {
   gufo_path: string;
+  model_family: ModelFamily;
   model_path: string;
   mtp_path: string;
   dspark_path: string;

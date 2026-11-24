@@ -23,20 +23,16 @@ import {
   Globe,
   RefreshCw,
   Layers,
-  Plus,
-  Trash2,
 } from 'lucide-react';
 import {
   GufoServerConfig,
-  ModelProfile,
   ServerStatus,
-  SpeculativeMode,
   WebSearchConfig,
-  YarnMode,
 } from '../types';
+import { ModelConfigView } from './ModelConfigView';
 import { WebSearchSettingsView } from './WebSearchSettingsView';
 
-export type ConfigSubTab = 'inference' | 'preferences' | 'web_search' | 'api_guide';
+export type ConfigSubTab = 'model' | 'server' | 'web_search' | 'preferences' | 'api_guide';
 
 interface ConfigViewProps {
   config: GufoServerConfig;
@@ -71,119 +67,6 @@ const checkboxLabelStyle: React.CSSProperties = {
   cursor: 'pointer',
 };
 
-const STANDARD_CONTEXT_OPTIONS = [32768, 65536, 131072, 262144, 409600, 524288, 1048576];
-
-function splitCliArgsPreview(raw: string): string[] {
-  const args: string[] = [];
-  let current = '';
-  let hasToken = false;
-  let inSingle = false;
-  let inDouble = false;
-
-  for (let i = 0; i < raw.length; i++) {
-    const c = raw[i];
-    if (inDouble) {
-      if (c === '\\' && raw[i + 1] === '"') {
-        current += '"';
-        i++;
-      } else if (c === '"') {
-        inDouble = false;
-      } else {
-        current += c;
-      }
-    } else if (inSingle) {
-      if (c === "'") {
-        inSingle = false;
-      } else {
-        current += c;
-      }
-    } else if (/\s/.test(c)) {
-      if (hasToken) {
-        args.push(current);
-        current = '';
-        hasToken = false;
-      }
-    } else if (c === '"') {
-      inDouble = true;
-      hasToken = true;
-    } else if (c === "'") {
-      inSingle = true;
-      hasToken = true;
-    } else {
-      current += c;
-      hasToken = true;
-    }
-  }
-  if (hasToken) {
-    args.push(current);
-  }
-  return args;
-}
-
-function quoteCliPreview(arg: string): string {
-  return arg.includes(' ') ? `"${arg}"` : arg;
-}
-
-function buildCliPreview(cfg: GufoServerConfig): string {
-  const bindHost = (cfg.host || '').trim().replace(/^\[|\]$/g, '') || '0.0.0.0';
-  const args: string[] = [
-    cfg.gufo_path || 'gufo.exe',
-    'serve',
-    '--host',
-    bindHost,
-    '--port',
-    String(cfg.port),
-    '--sessions',
-    String(cfg.sessions),
-    '--max-request-bytes',
-    String(cfg.max_request_bytes),
-    'llm',
-    '--model',
-    cfg.model_path || '<model.gguf>',
-    '--served-model-name',
-    cfg.served_model_name || 'model',
-    '--context',
-    String(cfg.context),
-  ];
-
-  const yarnMode = cfg.yarn_mode || 'auto';
-  const enableYarn =
-    yarnMode === 'on' || (yarnMode !== 'off' && cfg.context > 262144);
-  if (enableYarn) {
-    args.push('--enable-yarn');
-  }
-
-  args.push(
-    '--max-output-bytes',
-    String(cfg.max_output_bytes),
-    '--think',
-    cfg.think,
-    '--temperature',
-    String(cfg.temperature)
-  );
-  if (cfg.max_tokens > 0) {
-    args.push('--max-tokens', String(cfg.max_tokens));
-  }
-  if (cfg.speculative === 'mtp' && cfg.mtp_path.trim()) {
-    args.push('--speculative', 'mtp', '--mtp-model', cfg.mtp_path.trim());
-  } else if (cfg.speculative === 'dspark' && cfg.dspark_path.trim()) {
-    args.push('--speculative', 'dspark', '--dspark-model', cfg.dspark_path.trim());
-  }
-  if (cfg.cache_disk) {
-    args.push('--cache-disk', cfg.cache_disk_dir.trim() || 'gufo-cache');
-    if (cfg.cache_disk_bytes > 0) {
-      args.push('--cache-disk-bytes', String(cfg.cache_disk_bytes));
-    }
-  }
-  if (cfg.vision_path.trim()) {
-    args.push('--mmproj', cfg.vision_path.trim());
-  }
-  if (cfg.extra_args?.trim()) {
-    args.push(...splitCliArgsPreview(cfg.extra_args));
-  }
-  return args.map(quoteCliPreview).join(' ');
-}
-
 export const ConfigView: React.FC<ConfigViewProps> = ({
   config: initialConfig,
   status,
@@ -195,7 +78,7 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
   activeSubTab,
   onSubTabChange,
 }) => {
-  const [internalSubTab, setInternalSubTab] = useState<ConfigSubTab>('inference');
+  const [internalSubTab, setInternalSubTab] = useState<ConfigSubTab>('model');
   const subTab = activeSubTab ?? internalSubTab;
   const setSubTab = (tab: ConfigSubTab) => {
     setInternalSubTab(tab);
@@ -207,9 +90,6 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
   const [prefSaved, setPrefSaved] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
   const [certRegenMsg, setCertRegenMsg] = useState<string | null>(null);
-  const [showSaveProfile, setShowSaveProfile] = useState(false);
-  const [newProfileName, setNewProfileName] = useState('');
-  const [profileNotice, setProfileNotice] = useState<string | null>(null);
 
   const handleRegenerateCert = async () => {
     try {
@@ -298,150 +178,39 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
     setTimeout(() => setPrefSaved(false), 2000);
   };
 
-  const handleSave = () => {
-    onSaveConfig(form);
+  const handleSave = (overrideConfig?: GufoServerConfig) => {
+    onSaveConfig(overrideConfig ?? form);
     setSavedSuccess(true);
     setTimeout(() => setSavedSuccess(false), 2500);
   };
 
-  const showProfileMsg = (msg: string) => {
-    setProfileNotice(msg);
-    setTimeout(() => setProfileNotice(null), 5000);
-  };
-
-  const applyPreset = (preset: 'qwen3.8' | 'inkling2') => {
-    if (preset === 'qwen3.8') {
-      setForm((prev) => ({
-        ...prev,
-        served_model_name: 'flash-next',
-        speculative: 'mtp',
-        yarn_mode: 'auto',
-        context: 131072,
-        sessions: 2,
-        think: 'off',
-        temperature: 0,
-      }));
-      showProfileMsg('已套用 Qwen3.8-Flash-Next 建議參數，請確認下方模型路徑並點擊「儲存配置」。');
-    } else {
-      setForm((prev) => ({
-        ...prev,
-        served_model_name: 'inkling-2-mini',
-        speculative: prev.dspark_path.trim() ? 'dspark' : 'off',
-        yarn_mode: 'off',
-        context: 65536,
-        sessions: 2,
-        think: 'auto',
-        temperature: 0,
-      }));
-      showProfileMsg(
-        '已套用 Inkling-2-Mini 建議參數（YaRN 關閉、支援最高 1M Context）。請於下方選取 Inkling-2-Mini 主模型、可選 mmproj 與 DSpark 模型後按「儲存配置」。'
-      );
-    }
-  };
-
-  const toProfileSnapshot = (id: string, name: string, cfg: GufoServerConfig): ModelProfile => ({
-    id,
-    name,
-    model_path: cfg.model_path,
-    mtp_path: cfg.mtp_path,
-    dspark_path: cfg.dspark_path,
-    vision_path: cfg.vision_path,
-    served_model_name: cfg.served_model_name,
-    context: cfg.context,
-    sessions: cfg.sessions,
-    think: cfg.think,
-    temperature: cfg.temperature,
-    max_tokens: cfg.max_tokens,
-    speculative: cfg.speculative,
-    yarn_mode: cfg.yarn_mode,
-    extra_args: cfg.extra_args,
-  });
-
-  const handleSelectProfile = (profileId: string) => {
-    if (!profileId) {
-      setForm((prev) => ({ ...prev, active_profile_id: '' }));
-      return;
-    }
-    const found = (form.model_profiles || []).find((p) => p.id === profileId);
-    if (!found) return;
-    setForm((prev) => ({
-      ...prev,
-      active_profile_id: found.id,
-      model_path: found.model_path,
-      mtp_path: found.mtp_path,
-      dspark_path: found.dspark_path,
-      vision_path: found.vision_path,
-      served_model_name: found.served_model_name,
-      context: found.context,
-      sessions: found.sessions,
-      think: found.think,
-      temperature: found.temperature,
-      max_tokens: found.max_tokens,
-      speculative: found.speculative,
-      yarn_mode: found.yarn_mode,
-      extra_args: found.extra_args,
-    }));
-    showProfileMsg(`已載入設定檔「${found.name}」，確認無誤後請點擊「儲存配置」。`);
-  };
-
-  const handleCreateProfile = (e: React.FormEvent) => {
-    e.preventDefault();
-    const cleanName = newProfileName.trim();
-    if (!cleanName) return;
-    const id = `profile_${Date.now()}`;
-    const snap = toProfileSnapshot(id, cleanName, form);
-    const updated: GufoServerConfig = {
-      ...form,
-      model_profiles: [...(form.model_profiles || []), snap],
-      active_profile_id: id,
-    };
-    setForm(updated);
-    onSaveConfig(updated);
-    setNewProfileName('');
-    setShowSaveProfile(false);
-    showProfileMsg(`已儲存新設定檔「${cleanName}」。`);
-  };
-
-  const handleUpdateActiveProfile = () => {
-    const existing = (form.model_profiles || []).find((p) => p.id === form.active_profile_id);
-    if (!existing) return;
-    const snap = toProfileSnapshot(existing.id, existing.name, form);
-    const updated: GufoServerConfig = {
-      ...form,
-      model_profiles: (form.model_profiles || []).map((p) => (p.id === existing.id ? snap : p)),
-    };
-    setForm(updated);
-    onSaveConfig(updated);
-    showProfileMsg(`已更新設定檔「${existing.name}」。`);
-  };
-
-  const handleDeleteActiveProfile = () => {
-    const existing = (form.model_profiles || []).find((p) => p.id === form.active_profile_id);
-    if (!existing) return;
-    if (!confirm(`確定要刪除模型設定檔「${existing.name}」嗎？`)) return;
-    const updated: GufoServerConfig = {
-      ...form,
-      model_profiles: (form.model_profiles || []).filter((p) => p.id !== existing.id),
-      active_profile_id: '',
-    };
-    setForm(updated);
-    onSaveConfig(updated);
-    showProfileMsg(`已刪除設定檔「${existing.name}」。`);
-  };
-
-  const activeProfile = (form.model_profiles || []).find((p) => p.id === form.active_profile_id);
-
   return (
     <div className="config-container">
-      {/* 頂部次導覽分頁：推論核心配置 vs 系統偏好設定 */}
+      {/* 頂部次導覽分頁：模型配置 vs 伺服器與網路 vs WebSearch vs 系統偏好 vs API 指南 */}
       <div className="config-nav">
         <button
           type="button"
-          className={`config-nav-btn ${subTab === 'inference' ? 'active' : ''}`}
-          onClick={() => setSubTab('inference')}
+          className={`config-nav-btn ${subTab === 'model' ? 'active' : ''}`}
+          onClick={() => setSubTab('model')}
+        >
+          <Layers size={15} />
+          <span>模型配置 (Model)</span>
+        </button>
+        <button
+          type="button"
+          className={`config-nav-btn ${subTab === 'server' ? 'active' : ''}`}
+          onClick={() => setSubTab('server')}
         >
           <Cpu size={15} />
-          <span>伺服器與推論設定 (Inference)</span>
+          <span>伺服器與網路 (Server)</span>
+        </button>
+        <button
+          type="button"
+          className={`config-nav-btn ${subTab === 'web_search' ? 'active' : ''}`}
+          onClick={() => setSubTab('web_search')}
+        >
+          <Globe size={15} />
+          <span>網路搜尋 (WebSearch)</span>
         </button>
         <button
           type="button"
@@ -449,7 +218,7 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
           onClick={() => setSubTab('preferences')}
         >
           <SlidersHorizontal size={15} />
-          <span>系統啟動偏好設定 (Preferences)</span>
+          <span>系統偏好 (Preferences)</span>
           {prefSaved && (
             <span
               style={{
@@ -467,161 +236,59 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
         </button>
         <button
           type="button"
-          className={`config-nav-btn ${subTab === 'web_search' ? 'active' : ''}`}
-          onClick={() => setSubTab('web_search')}
-        >
-          <Globe size={15} />
-          <span>網路搜尋 (WebSearch)</span>
-        </button>
-        <button
-          type="button"
           className={`config-nav-btn ${subTab === 'api_guide' ? 'active' : ''}`}
           onClick={() => setSubTab('api_guide')}
         >
           <Terminal size={15} />
-          <span>API 串接與效能速度指南 (API & Metrics)</span>
+          <span>API 指南 (API &amp; Metrics)</span>
         </button>
       </div>
 
-      {/* 分頁一：伺服器與推論設定 (Inference) */}
-      {subTab === 'inference' && (
+      {/* 分頁一：模型配置 (Model) */}
+      {subTab === 'model' && (
         <>
           {isRunning && (
             <div className="server-running-banner">
               <Info size={16} />
               <span>
-                伺服器目前正在運行中 (Port {form.port})。若需變更推論引擎參數或更換模型，請先點擊右上角「停止伺服器」。
+                伺服器目前正在運行中 (Port {form.port})。若需切換模型或調整模型參數，請先點擊右上角「停止伺服器」。
+              </span>
+            </div>
+          )}
+          <ModelConfigView
+            form={form}
+            onChangeForm={setForm}
+            onSaveConfig={onSaveConfig}
+            onResetDefaults={onResetDefaults}
+            isRunning={isRunning}
+            pathStatus={pathStatus}
+            onBrowse={handleBrowse}
+            savedSuccess={savedSuccess}
+            onSave={handleSave}
+          />
+        </>
+      )}
+
+      {/* 分頁二：伺服器與網路設定 (Server) */}
+      {subTab === 'server' && (
+        <>
+          {isRunning && (
+            <div className="server-running-banner">
+              <Info size={16} />
+              <span>
+                伺服器目前正在運行中 (Port {form.port})。若需變更推論引擎路徑或網路安全設定，請先點擊右上角「停止伺服器」。
               </span>
             </div>
           )}
 
-          {/* 模型設定檔與快速範本卡片 */}
-          <div className="config-card">
-            <div className="card-title">
-              <Layers size={18} color="#38bdf8" />
-              <span>模型設定檔與快速範本 (Profiles &amp; Presets)</span>
-            </div>
-            <div className="card-subtitle">
-              可一鍵套用模型建議參數，或將目前模型路徑與推論設定儲存為設定檔，方便於多個模型之間快速切換。
-            </div>
-
-            <div className="profile-toolbar">
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 240 }}>
-                <select
-                  className="form-input"
-                  style={{ flex: 1 }}
-                  value={form.active_profile_id || ''}
-                  disabled={isRunning}
-                  onChange={(e) => handleSelectProfile(e.target.value)}
-                >
-                  <option value="">-- 選擇已儲存的模型設定檔 ({(form.model_profiles || []).length}) --</option>
-                  {(form.model_profiles || []).map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name} ({p.served_model_name || '未命名'})
-                    </option>
-                  ))}
-                </select>
-
-                {activeProfile && (
-                  <>
-                    <button
-                      type="button"
-                      className="btn btn-secondary"
-                      disabled={isRunning}
-                      onClick={handleUpdateActiveProfile}
-                      title="以目前表單內容覆寫更新此設定檔"
-                    >
-                      <Save size={13} />
-                      <span>更新</span>
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-secondary"
-                      style={{ color: '#fb7185' }}
-                      disabled={isRunning}
-                      onClick={handleDeleteActiveProfile}
-                      title="刪除此設定檔"
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  </>
-                )}
-              </div>
-
-              <button
-                type="button"
-                className="btn btn-secondary"
-                disabled={isRunning}
-                onClick={() => setShowSaveProfile((v) => !v)}
-              >
-                <Plus size={14} />
-                <span>另存為新設定檔</span>
-              </button>
-            </div>
-
-            {showSaveProfile && (
-              <form
-                onSubmit={handleCreateProfile}
-                style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center' }}
-              >
-                <input
-                  type="text"
-                  className="form-input"
-                  style={{ flex: 1 }}
-                  placeholder="輸入設定檔名稱，例如：Inkling-2-Mini (64K + DSpark)"
-                  value={newProfileName}
-                  onChange={(e) => setNewProfileName(e.target.value)}
-                  autoFocus
-                  required
-                />
-                <button type="submit" className="btn btn-emerald" disabled={!newProfileName.trim()}>
-                  確認儲存
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-secondary"
-                  onClick={() => setShowSaveProfile(false)}
-                >
-                  取消
-                </button>
-              </form>
-            )}
-
-            <div className="preset-chip-row">
-              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>快速套用參數範本：</span>
-              <button
-                type="button"
-                className="btn btn-secondary"
-                style={{ padding: '4px 10px', fontSize: 12 }}
-                disabled={isRunning}
-                onClick={() => applyPreset('qwen3.8')}
-              >
-                套用 Qwen3.8-Flash-Next 建議參數
-              </button>
-              <button
-                type="button"
-                className="btn btn-secondary"
-                style={{ padding: '4px 10px', fontSize: 12, borderColor: 'rgba(56, 189, 248, 0.45)', color: '#38bdf8' }}
-                disabled={isRunning}
-                onClick={() => applyPreset('inkling2')}
-              >
-                套用 Inkling-2-Mini 建議參數
-              </button>
-            </div>
-
-            {profileNotice && (
-              <div style={{ marginTop: 10, fontSize: 12, color: '#34d399' }}>{profileNotice}</div>
-            )}
-          </div>
-
-          {/* 核心路徑配置卡片 */}
+          {/* 推論引擎執行檔路徑卡片 */}
           <div className="config-card">
             <div className="card-title">
               <HardDrive size={18} color="#06b6d4" />
-              <span>核心模型與執行檔路徑 (Model & Binary Paths)</span>
+              <span>Gufo 推論引擎執行檔路徑</span>
             </div>
             <div className="card-subtitle">
-              設定 Gufo 引擎執行檔、主模型 GGUF、投機加速草稿模型與多模態視覺投影檔。
+              指定本機 `gufo.exe` 執行檔位置（所有模型皆共用同一推論引擎主程式）。
             </div>
 
             <div className="form-grid single-col">
@@ -668,211 +335,17 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                   </button>
                 </div>
               </div>
-
-              {/* 模型主檔路徑 */}
-              <div className="form-group">
-                <div className="form-label">
-                  <span>主模型檔案 (GGUF)</span>
-                  {pathStatus.model_path ? (
-                    <span style={{ color: '#10b981', display: 'flex', alignItems: 'center', gap: 4 }}>
-                      <CheckCircle2 size={13} /> 檔案存在
-                    </span>
-                  ) : (
-                    <span style={{ color: '#f43f5e', display: 'flex', alignItems: 'center', gap: 4 }}>
-                      <AlertCircle size={13} /> 檔案不存在
-                    </span>
-                  )}
-                </div>
-                <div className="path-input-group">
-                  <input
-                    type="text"
-                    className="form-input"
-                    value={form.model_path}
-                    placeholder="工作目錄相對路徑或絕對路徑，例如: models\Inkling-2-Mini-GGUF\Inkling-2-Mini-UD-Q4_K_M.gguf"
-                    disabled={isRunning}
-                    onChange={(e) => handleChange('model_path', e.target.value)}
-                  />
-                  <button
-                    type="button"
-                    className="btn btn-secondary"
-                    style={{ flexShrink: 0, padding: '7px 12px' }}
-                    disabled={isRunning}
-                    onClick={() =>
-                      handleBrowse(
-                        'model_path',
-                        '選擇主模型 (GGUF)',
-                        'GGUF 模型檔 (*.gguf)',
-                        ['gguf']
-                      )
-                    }
-                    title="瀏覽選擇主模型 GGUF 檔案"
-                  >
-                    <FolderOpen size={14} />
-                    <span>瀏覽...</span>
-                  </button>
-                </div>
-              </div>
-
-              {/* MTP 投機解碼模型 (僅當 speculative === 'mtp' 時顯示) */}
-              {form.speculative === 'mtp' && (
-                <div className="form-group">
-                  <div className="form-label">
-                    <span>MTP 投機解碼加速模型 (--mtp-model)</span>
-                    {pathStatus.mtp_path ? (
-                      <span style={{ color: '#10b981', display: 'flex', alignItems: 'center', gap: 4 }}>
-                        <CheckCircle2 size={13} /> 檔案存在
-                      </span>
-                    ) : (
-                      <span style={{ color: '#f43f5e', display: 'flex', alignItems: 'center', gap: 4 }}>
-                        <AlertCircle size={13} /> 檔案不存在
-                      </span>
-                    )}
-                  </div>
-                  <div className="path-input-group">
-                    <input
-                      type="text"
-                      className="form-input"
-                      value={form.mtp_path}
-                      placeholder="工作目錄相對路徑或絕對路徑，例如: models\Qwen3.8-Flash-Next-GGUF\mtp-*.gguf"
-                      disabled={isRunning}
-                      onChange={(e) => handleChange('mtp_path', e.target.value)}
-                    />
-                    <button
-                      type="button"
-                      className="btn btn-secondary"
-                      style={{ flexShrink: 0, padding: '7px 12px' }}
-                      disabled={isRunning}
-                      onClick={() =>
-                        handleBrowse(
-                          'mtp_path',
-                          '選擇 MTP 投機解碼加速模型 (GGUF)',
-                          'GGUF 模型檔 (*.gguf)',
-                          ['gguf']
-                        )
-                      }
-                      title="瀏覽選擇 MTP 模型 GGUF 檔案"
-                    >
-                      <FolderOpen size={14} />
-                      <span>瀏覽...</span>
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {/* DSpark 投機解碼模型 (僅當 speculative === 'dspark' 時顯示) */}
-              {form.speculative === 'dspark' && (
-                <div className="form-group">
-                  <div className="form-label">
-                    <span>DSpark 投機解碼加速模型 (--dspark-model，Inkling-2-Mini 專用)</span>
-                    {form.dspark_path.trim() ? (
-                      pathStatus.dspark_path ? (
-                        <span style={{ color: '#10b981', display: 'flex', alignItems: 'center', gap: 4 }}>
-                          <CheckCircle2 size={13} /> 檔案存在
-                        </span>
-                      ) : (
-                        <span style={{ color: '#f43f5e', display: 'flex', alignItems: 'center', gap: 4 }}>
-                          <AlertCircle size={13} /> 檔案不存在
-                        </span>
-                      )
-                    ) : (
-                      <span style={{ color: '#94a3b8' }}>尚未指定檔案</span>
-                    )}
-                  </div>
-                  <div className="path-input-group">
-                    <input
-                      type="text"
-                      className="form-input"
-                      value={form.dspark_path || ''}
-                      placeholder="例如: models\Inkling-2-Mini-GGUF\Inkling-2-Mini-dspark-Q8_0.gguf"
-                      disabled={isRunning}
-                      onChange={(e) => handleChange('dspark_path', e.target.value)}
-                    />
-                    <button
-                      type="button"
-                      className="btn btn-secondary"
-                      style={{ flexShrink: 0, padding: '7px 12px' }}
-                      disabled={isRunning}
-                      onClick={() =>
-                        handleBrowse(
-                          'dspark_path',
-                          '選擇 DSpark 投機解碼加速模型 (GGUF)',
-                          'GGUF 模型檔 (*.gguf)',
-                          ['gguf']
-                        )
-                      }
-                      title="瀏覽選擇 DSpark 模型 GGUF 檔案"
-                    >
-                      <FolderOpen size={14} />
-                      <span>瀏覽...</span>
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {form.speculative === 'off' && (
-                <div style={hintStyle}>
-                  投機解碼目前已設為關閉 (<code>off</code>)，無須設定 MTP 或 DSpark 草稿模型。若需啟用請至下方「投機解碼模式」切換。
-                </div>
-              )}
-
-              {/* Vision 視覺側車模型 */}
-              <div className="form-group">
-                <div className="form-label">
-                  <span>多模態視覺模型 (mmproj-*.gguf，選填)</span>
-                  {form.vision_path.trim() ? (
-                    pathStatus.vision_path ? (
-                      <span style={{ color: '#10b981', display: 'flex', alignItems: 'center', gap: 4 }}>
-                        <CheckCircle2 size={13} /> 檔案存在
-                      </span>
-                    ) : (
-                      <span style={{ color: '#f43f5e', display: 'flex', alignItems: 'center', gap: 4 }}>
-                        <AlertCircle size={13} /> 檔案不存在
-                      </span>
-                    )
-                  ) : (
-                    <span style={{ color: '#94a3b8' }}>留空（純文字模式）</span>
-                  )}
-                </div>
-                <div className="path-input-group">
-                  <input
-                    type="text"
-                    className="form-input"
-                    value={form.vision_path}
-                    placeholder="工作目錄相對路徑或絕對路徑，例如: models\Qwen3.8-Flash-Next-GGUF\mmproj-BF16.gguf"
-                    disabled={isRunning}
-                    onChange={(e) => handleChange('vision_path', e.target.value)}
-                  />
-                  <button
-                    type="button"
-                    className="btn btn-secondary"
-                    style={{ flexShrink: 0, padding: '7px 12px' }}
-                    disabled={isRunning}
-                    onClick={() =>
-                      handleBrowse(
-                        'vision_path',
-                        '選擇多模態視覺模型 (mmproj *.gguf)',
-                        'GGUF 模型檔 (*.gguf)',
-                        ['gguf']
-                      )
-                    }
-                    title="瀏覽選擇視覺模型 GGUF 檔案"
-                  >
-                    <FolderOpen size={14} />
-                    <span>瀏覽...</span>
-                  </button>
-                </div>
-              </div>
             </div>
           </div>
 
-          {/* 伺服器與推論超參數卡片 */}
+          {/* 伺服器網路、磁碟快取與安全連線卡片 */}
           <div className="config-card">
             <div className="card-title">
               <Cpu size={18} color="#8b5cf6" />
-              <span>網路與推論超參數 (Server & Inference Options)</span>
+              <span>網路綁定、快取與安全連線 (Server &amp; Security)</span>
             </div>
             <div className="card-subtitle">
-              管理 OpenAI API 連接埠、上下文長度、並發會話與投機策略。
+              管理 OpenAI API 監聽位址與埠號、磁碟 KV 快取、API Key 驗證與內建 HTTPS 代理。
             </div>
 
             <div className="form-grid">
@@ -939,168 +412,6 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                   disabled={isRunning}
                   onChange={(e) => handleChange('port', clampInt(e.target.value, 1, 65535))}
                 />
-              </div>
-
-              {/* 服務識別名稱 */}
-              <div className="form-group">
-                <div className="form-label">
-                  <span>模型服務識別名稱 (Served Model Name)</span>
-                </div>
-                <input
-                  type="text"
-                  className="form-input"
-                  value={form.served_model_name}
-                  disabled={isRunning}
-                  onChange={(e) => handleChange('served_model_name', e.target.value)}
-                />
-              </div>
-
-              {/* Context 長度 */}
-              <div className="form-group">
-                <div className="form-label">
-                  <span>上下文視窗長度 (Context Tokens)</span>
-                </div>
-                <select
-                  className="form-input"
-                  value={form.context}
-                  disabled={isRunning}
-                  onChange={(e) => handleChange('context', parseInt(e.target.value))}
-                >
-                  <option value={32768}>32,768 (32K)</option>
-                  <option value={65536}>65,536 (64K)</option>
-                  <option value={131072}>131,072 (128K 推薦)</option>
-                  <option value={262144}>262,144 (256K Qwen3.8 原生上限)</option>
-                  <option value={409600}>409,600 (400K)</option>
-                  <option value={524288}>524,288 (512K)</option>
-                  <option value={1048576}>1,048,576 (1M - Inkling-2-Mini 原生上限)</option>
-                  {!STANDARD_CONTEXT_OPTIONS.includes(form.context) && (
-                    <option value={form.context}>{form.context.toLocaleString()} (自訂)</option>
-                  )}
-                </select>
-                <div style={hintStyle}>
-                  若使用原生 1M Context 模型（如 Inkling-2-Mini），請確認下方 YaRN 模式設為 <code>off</code>。
-                </div>
-              </div>
-
-              {/* YaRN 位置編碼擴展模式 */}
-              <div className="form-group">
-                <div className="form-label">
-                  <span>YaRN 位置編碼擴展 (--enable-yarn)</span>
-                </div>
-                <select
-                  className="form-input"
-                  value={form.yarn_mode || 'auto'}
-                  disabled={isRunning}
-                  onChange={(e) => handleChange('yarn_mode', e.target.value as YarnMode)}
-                >
-                  <option value="auto">auto (超過 256K 自動附加 — Qwen3.8 適用)</option>
-                  <option value="off">off (不附加 — Inkling-2-Mini 原生 1M 適用)</option>
-                  <option value="on">on (強制一律附加 --enable-yarn)</option>
-                </select>
-                <div style={hintStyle}>
-                  控制啟動時是否傳遞 <code>--enable-yarn</code> 旗標。
-                </div>
-              </div>
-
-              {/* GPU 並發 Sessions */}
-              <div className="form-group">
-                <div className="form-label">
-                  <span>GPU 並發會話數 (Sessions)</span>
-                </div>
-                <select
-                  className="form-input"
-                  value={form.sessions}
-                  disabled={isRunning}
-                  onChange={(e) => handleChange('sessions', parseInt(e.target.value))}
-                >
-                  <option value={1}>1 (單會話，顯存最省)</option>
-                  <option value={2}>2 (雙路並發，推薦)</option>
-                  <option value={4}>4 (多路並發)</option>
-                </select>
-                <div style={hintStyle}>
-                  目前 context × sessions = {(form.context * form.sessions).toLocaleString()} tokens。官方 <code>v0.35.0+</code> 支援按需映射 (Demand-mapped) KV 狀態與動態會話共享；若硬體可用記憶體小於 96GB，過大的配置仍可能影響載入與並發排隊。
-                </div>
-              </div>
-
-              {/* 投機解碼模式 */}
-              <div className="form-group">
-                <div className="form-label">
-                  <span>投機解碼模式 (--speculative)</span>
-                </div>
-                <select
-                  className="form-input"
-                  value={
-                    form.speculative === 'dspark'
-                      ? 'dspark'
-                      : form.speculative === 'off'
-                      ? 'off'
-                      : 'mtp'
-                  }
-                  disabled={isRunning}
-                  onChange={(e) => handleChange('speculative', e.target.value as SpeculativeMode)}
-                >
-                  <option value="mtp">mtp (MTP 投機加速 — Qwen3.8 適用)</option>
-                  <option value="dspark">dspark (DSpark 投機加速 — Inkling-2-Mini 適用)</option>
-                  <option value="off">off (關閉投機，僅使用單步自回歸解碼)</option>
-                </select>
-                <div style={hintStyle}>
-                  切換後上方會顯示對應的草稿模型路徑設定欄位（<code>--mtp-model</code> 或 <code>--dspark-model</code>）。
-                </div>
-              </div>
-
-              {/* 預設思考模式 */}
-              <div className="form-group">
-                <div className="form-label">
-                  <span>預設思考鏈狀態 (Think Mode)</span>
-                </div>
-                <select
-                  className="form-input"
-                  value={form.think}
-                  disabled={isRunning}
-                  onChange={(e) => handleChange('think', e.target.value)}
-                >
-                  <option value="off">off (關閉思考，延遲最低)</option>
-                  <option value="on">on (開啟深度推導思考)</option>
-                  <option value="auto">auto (自動遵循模型提示)</option>
-                </select>
-                <div style={hintStyle}>
-                  僅為伺服器預設值；聊天頁的思考鏈開關會以 <code>chat_template_kwargs.enable_thinking</code> 逐請求覆寫。
-                </div>
-              </div>
-
-              {/* 預設採樣溫度 */}
-              <div className="form-group">
-                <div className="form-label">
-                  <span>預設採樣溫度 (Temperature)</span>
-                </div>
-                <input
-                  type="number"
-                  className="form-input"
-                  min={0}
-                  max={2}
-                  step={0.05}
-                  value={form.temperature}
-                  disabled={isRunning}
-                  onChange={(e) => handleChange('temperature', clampNumber(e.target.value, 0, 2, 0))}
-                />
-                <div style={hintStyle}>0 = 貪婪解碼 (MTP 接受率最高、速度最快)；請求可自行覆寫。</div>
-              </div>
-
-              {/* 預設最大生成長度 */}
-              <div className="form-group">
-                <div className="form-label">
-                  <span>預設最大生成 Tokens (--max-tokens)</span>
-                </div>
-                <input
-                  type="number"
-                  className="form-input"
-                  min={0}
-                  step={1024}
-                  value={form.max_tokens}
-                  disabled={isRunning}
-                  onChange={(e) => handleChange('max_tokens', clampInt(e.target.value, 0))}
-                />
-                <div style={hintStyle}>請求未帶 max_tokens 時的上限；0 = 交給 Gufo 預設 (直到 EOS 或 context 用盡)。</div>
               </div>
 
               {/* 磁碟 Prompt 快取 */}
@@ -1358,31 +669,6 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                 )}
               </div>
 
-              {/* 額外 CLI 啟動參數 */}
-              <div className="form-group" style={{ gridColumn: 'span 2' }}>
-                <div className="form-label">
-                  <span>額外 CLI 啟動參數 (Extra Arguments，選填)</span>
-                </div>
-                <input
-                  type="text"
-                  className="form-input"
-                  placeholder="例如: --extension extensions\inkling2.dll（支援以雙引號包住含空白的路徑）"
-                  value={form.extra_args || ''}
-                  disabled={isRunning}
-                  onChange={(e) => handleChange('extra_args', e.target.value)}
-                />
-                <div style={hintStyle}>
-                  會直接附加於啟動指令尾端，適合傳遞社群擴充套件或引擎實驗旗標。
-                </div>
-              </div>
-
-              {/* 即時啟動指令預覽 */}
-              <div className="form-group" style={{ gridColumn: 'span 2' }}>
-                <div className="form-label">
-                  <span>啟動指令預覽 (Command Preview)</span>
-                </div>
-                <div className="cli-preview-box">{buildCliPreview(form)}</div>
-              </div>
             </div>
 
             {/* 底部按鈕區 */}
@@ -1391,9 +677,9 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
                 <RotateCcw size={14} />
                 <span>還原預設配置</span>
               </button>
-              <button className="btn btn-primary" onClick={handleSave} disabled={isRunning}>
+              <button className="btn btn-primary" onClick={() => handleSave()} disabled={isRunning}>
                 <Save size={14} />
-                <span>{savedSuccess ? '已儲存！' : '儲存配置'}</span>
+                <span>{savedSuccess ? '已儲存！' : '儲存伺服器配置'}</span>
               </button>
             </div>
           </div>

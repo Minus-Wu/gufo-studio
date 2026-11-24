@@ -29,6 +29,7 @@ const SLOW_LOAD_HINT_AFTER: Duration = Duration::from_secs(180);
 pub struct ModelProfile {
     pub id: String,
     pub name: String,
+    pub model_family: String,
     pub model_path: String,
     pub mtp_path: String,
     pub dspark_path: String,
@@ -49,6 +50,7 @@ impl Default for ModelProfile {
         Self {
             id: String::new(),
             name: String::new(),
+            model_family: "qwen3.8-flash-next".to_string(),
             model_path: String::new(),
             mtp_path: String::new(),
             dspark_path: String::new(),
@@ -71,6 +73,7 @@ impl Default for ModelProfile {
 #[serde(default)]
 pub struct GufoServerConfig {
     pub gufo_path: String,
+    pub model_family: String,
     pub model_path: String,
     pub mtp_path: String,
     pub dspark_path: String,
@@ -157,6 +160,7 @@ impl Default for GufoServerConfig {
 
         Self {
             gufo_path: default_gufo,
+            model_family: "qwen3.8-flash-next".to_string(),
             model_path: in_model_dir(MODEL_FILE),
             mtp_path: in_model_dir("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"),
             dspark_path: String::new(),
@@ -1486,6 +1490,7 @@ mod tests {
         assert!(cfg.https_enabled);
         assert_eq!(cfg.https_port, 12443);
         assert_eq!(cfg.yarn_mode, "auto");
+        assert_eq!(cfg.model_family, "qwen3.8-flash-next");
         assert!(cfg.dspark_path.is_empty());
         assert!(cfg.extra_args.is_empty());
         assert!(cfg.model_profiles.is_empty());

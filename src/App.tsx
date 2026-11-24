@@ -21,7 +21,7 @@ import { DEFAULT_WEB_SEARCH_CONFIG } from './utils/webSearchHelpers';
 
 export function App() {
   const [activeTab, setActiveTab] = useState<'chat' | 'rag' | 'config' | 'logs'>('chat');
-  const [configSubTab, setConfigSubTab] = useState<ConfigSubTab>('inference');
+  const [configSubTab, setConfigSubTab] = useState<ConfigSubTab>('model');
   const [isStarting, setIsStarting] = useState(false);
   const [metricsHistory, setMetricsHistory] = useState<InferenceMetrics[]>([]);
   const [activeRequest, setActiveRequest] = useState<ActiveInferenceRequest | null>(null);
@@ -68,6 +68,7 @@ export function App() {
 
   const [config, setConfig] = useState<GufoServerConfig>({
     gufo_path: 'build\\release\\gufo.exe',
+    model_family: 'qwen3.8-flash-next',
     model_path:
       'models\\Qwen3.8-Flash-Next-GGUF\\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf',
     mtp_path:
