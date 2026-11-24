@@ -1650,3 +1650,35 @@ body {
   text-decoration: underline;
   color: #7dd3fc;
 }
+
+/* Model Profiles, Presets & CLI Preview */
+.profile-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.preset-chip-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-color);
+}
+
+.cli-preview-box {
+  background-color: #0b0e14;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: #7dd3fc;
+  word-break: break-all;
+  user-select: text;
+}

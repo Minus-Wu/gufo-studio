@@ -23,6 +23,49 @@ const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 /// 模型載入超過此時間仍未就緒時，於日誌提示可能的原因 (不會中斷載入)。
 const SLOW_LOAD_HINT_AFTER: Duration = Duration::from_secs(180);
 
+/// 可儲存的多模型設定檔項目 (方便在 Qwen3.8 / Inkling-2-Mini 等模型之間一鍵切換)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelProfile {
+    pub id: String,
+    pub name: String,
+    pub model_path: String,
+    pub mtp_path: String,
+    pub dspark_path: String,
+    pub vision_path: String,
+    pub served_model_name: String,
+    pub context: u32,
+    pub sessions: u32,
+    pub think: String,
+    pub temperature: f32,
+    pub max_tokens: u32,
+    pub speculative: String,
+    pub yarn_mode: String,
+    pub extra_args: String,
+}
+
+impl Default for ModelProfile {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            model_path: String::new(),
+            mtp_path: String::new(),
+            dspark_path: String::new(),
+            vision_path: String::new(),
+            served_model_name: "flash-next".to_string(),
+            context: 131072,
+            sessions: 2,
+            think: "off".to_string(),
+            temperature: 0.0,
+            max_tokens: 32768,
+            speculative: "off".to_string(),
+            yarn_mode: "auto".to_string(),
+            extra_args: String::new(),
+        }
+    }
+}
+
 /// 缺少的欄位一律採用 `Default`，讓舊版設定檔可直接升級。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -30,6 +73,7 @@ pub struct GufoServerConfig {
     pub gufo_path: String,
     pub model_path: String,
     pub mtp_path: String,
+    pub dspark_path: String,
     pub vision_path: String,
     pub served_model_name: String,
     pub host: String,
@@ -40,9 +84,17 @@ pub struct GufoServerConfig {
     pub max_output_bytes: u64,
     pub think: String, // "off", "on", "auto"
     pub temperature: f32,
-    pub speculative: String, // "mtp", "off"
+    pub speculative: String, // "mtp", "dspark", "off"
     pub mtp_policy: String,  // "survival", "length"
     pub prompt_lookup: bool,
+    /// YaRN 位置編碼擴展模式："auto" (超過 256K 自動附加)、"on" (強制開啟)、"off" (強制關閉)
+    pub yarn_mode: String,
+    /// 額外 CLI 啟動參數 (空白分隔，支援雙引號/單引號路徑)
+    pub extra_args: String,
+    /// 已儲存的多模型設定檔清單
+    pub model_profiles: Vec<ModelProfile>,
+    /// 目前套用的設定檔 ID
+    pub active_profile_id: String,
     pub api_key: String,
     pub auto_open_gui: bool,
     pub auto_start_server: bool,
@@ -107,6 +159,7 @@ impl Default for GufoServerConfig {
             gufo_path: default_gufo,
             model_path: in_model_dir(MODEL_FILE),
             mtp_path: in_model_dir("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"),
+            dspark_path: String::new(),
             vision_path: in_model_dir("mmproj-BF16.gguf"),
             served_model_name: "flash-next".to_string(),
             host: "0.0.0.0".to_string(),
@@ -120,6 +173,10 @@ impl Default for GufoServerConfig {
             speculative: "mtp".to_string(),
             mtp_policy: "survival".to_string(),
             prompt_lookup: true,
+            yarn_mode: "auto".to_string(),
+            extra_args: String::new(),
+            model_profiles: Vec::new(),
+            active_profile_id: String::new(),
             api_key: String::new(),
             auto_open_gui: true,
             auto_start_server: false,
@@ -367,11 +424,66 @@ fn is_listening_line(line: &str) -> bool {
     line.contains("event=listening")
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum SpeculativeArg<'a> {
+    Mtp(&'a Path),
+    Dspark(&'a Path),
+}
+
+/// 拆分額外 CLI 參數字串，支援單引號／雙引號包住的含空白路徑，並保留 Windows 反斜線路徑。
+pub fn split_cli_args(raw: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut has_token = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = raw.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if in_double {
+            if c == '\\' && chars.peek() == Some(&'"') {
+                if let Some(q) = chars.next() {
+                    current.push(q);
+                }
+            } else if c == '"' {
+                in_double = false;
+            } else {
+                current.push(c);
+            }
+        } else if in_single {
+            if c == '\'' {
+                in_single = false;
+            } else {
+                current.push(c);
+            }
+        } else if c.is_whitespace() {
+            if has_token {
+                args.push(std::mem::take(&mut current));
+                has_token = false;
+            }
+        } else if c == '"' {
+            in_double = true;
+            has_token = true;
+        } else if c == '\'' {
+            in_single = true;
+            has_token = true;
+        } else {
+            current.push(c);
+            has_token = true;
+        }
+    }
+
+    if has_token {
+        args.push(current);
+    }
+    args
+}
+
 /// 組裝官方 `gufo-org/gufo` (`v0.35.0+`) `gufo serve ... llm ...` 參數。純函式，方便測試。
 pub fn build_args(
     cfg: &GufoServerConfig,
     model: &Path,
-    mtp: Option<&Path>,
+    speculative: Option<SpeculativeArg<'_>>,
     vision: Option<&Path>,
     cache_dir: Option<&Path>,
 ) -> Vec<String> {
@@ -388,7 +500,12 @@ pub fn build_args(
     push(&["llm", "--model", &model.to_string_lossy()]);
     push(&["--served-model-name", &cfg.served_model_name]);
     push(&["--context", &cfg.context.to_string()]);
-    if cfg.context > FLASH_NEXT_NATIVE_CONTEXT {
+    let enable_yarn = match cfg.yarn_mode.trim().to_ascii_lowercase().as_str() {
+        "on" => true,
+        "off" => false,
+        _ => cfg.context > FLASH_NEXT_NATIVE_CONTEXT,
+    };
+    if enable_yarn {
         push(&["--enable-yarn"]);
     }
     push(&["--max-output-bytes", &cfg.max_output_bytes.to_string()]);
@@ -398,8 +515,19 @@ pub fn build_args(
         push(&["--max-tokens", &cfg.max_tokens.to_string()]);
     }
 
-    if let Some(mtp) = mtp {
-        push(&["--speculative", "mtp", "--mtp-model", &mtp.to_string_lossy()]);
+    match speculative {
+        Some(SpeculativeArg::Mtp(mtp)) => {
+            push(&["--speculative", "mtp", "--mtp-model", &mtp.to_string_lossy()]);
+        }
+        Some(SpeculativeArg::Dspark(dspark)) => {
+            push(&[
+                "--speculative",
+                "dspark",
+                "--dspark-model",
+                &dspark.to_string_lossy(),
+            ]);
+        }
+        None => {}
     }
 
     if let Some(dir) = cache_dir {
@@ -410,6 +538,9 @@ pub fn build_args(
     }
     if let Some(vision) = vision {
         push(&["--mmproj", &vision.to_string_lossy()]);
+    }
+    if !cfg.extra_args.trim().is_empty() {
+        args.extend(split_cli_args(&cfg.extra_args));
     }
     args
 }
@@ -1112,7 +1243,8 @@ impl GufoManager {
         }
 
         let mut warnings = Vec::new();
-        let mtp = if cfg.speculative == "mtp" && !cfg.mtp_path.trim().is_empty() {
+        let speculative_mode = cfg.speculative.trim().to_ascii_lowercase();
+        let mtp_path_buf = if speculative_mode == "mtp" && !cfg.mtp_path.trim().is_empty() {
             let p = Self::resolve_path(&cfg.mtp_path);
             if p.exists() {
                 Some(p)
@@ -1125,6 +1257,26 @@ impl GufoManager {
             }
         } else {
             None
+        };
+        let dspark_path_buf = if speculative_mode == "dspark" && !cfg.dspark_path.trim().is_empty()
+        {
+            let p = Self::resolve_path(&cfg.dspark_path);
+            if p.exists() {
+                Some(p)
+            } else {
+                warnings.push(format!(
+                    "[警告] 找不到 DSpark 模型 {}，本次將不使用投機解碼。",
+                    cfg.dspark_path
+                ));
+                None
+            }
+        } else {
+            None
+        };
+        let speculative_arg = match (mtp_path_buf.as_deref(), dspark_path_buf.as_deref()) {
+            (Some(p), _) => Some(SpeculativeArg::Mtp(p)),
+            (_, Some(p)) => Some(SpeculativeArg::Dspark(p)),
+            _ => None,
         };
         let vision = if !cfg.vision_path.trim().is_empty() {
             let p = Self::resolve_path(&cfg.vision_path);
@@ -1173,7 +1325,13 @@ impl GufoManager {
             self.shared.log(Some(&app), line).await;
         }
 
-        let args = build_args(&cfg, &resolved_model, mtp.as_deref(), vision.as_deref(), cache_dir.as_deref());
+        let args = build_args(
+            &cfg,
+            &resolved_model,
+            speculative_arg,
+            vision.as_deref(),
+            cache_dir.as_deref(),
+        );
         self.shared
             .log(Some(&app), format!("[系統] 準備啟動：{}", redacted_command(&resolved_gufo, &args)))
             .await;
@@ -1327,6 +1485,10 @@ mod tests {
         assert_eq!(cfg.cache_disk_dir, "gufo-cache");
         assert!(cfg.https_enabled);
         assert_eq!(cfg.https_port, 12443);
+        assert_eq!(cfg.yarn_mode, "auto");
+        assert!(cfg.dspark_path.is_empty());
+        assert!(cfg.extra_args.is_empty());
+        assert!(cfg.model_profiles.is_empty());
     }
 
     #[test]
@@ -1340,7 +1502,7 @@ mod tests {
         let args = build_args(
             &cfg,
             Path::new("model.gguf"),
-            Some(Path::new("mtp.gguf")),
+            Some(SpeculativeArg::Mtp(Path::new("mtp.gguf"))),
             None,
             Some(Path::new("cache dir")),
         );
@@ -1380,6 +1542,80 @@ mod tests {
         );
         assert!(!masked.contains("sk-gufo-secret"));
         assert!(masked.contains("--api-key ******"));
+    }
+
+    #[test]
+    fn test_build_args_inkling2_dspark_yarn_off_and_extra_args() {
+        let cfg = GufoServerConfig {
+            served_model_name: "inkling-2-mini".to_string(),
+            context: 1_048_576,
+            sessions: 4,
+            speculative: "dspark".to_string(),
+            yarn_mode: "off".to_string(),
+            extra_args: r#"--extension "D:\Models\Inkling 2\ext.dll" --log-level debug"#.to_string(),
+            ..Default::default()
+        };
+        let args = build_args(
+            &cfg,
+            Path::new("Inkling-2-Mini-UD-Q4_K_XL.gguf"),
+            Some(SpeculativeArg::Dspark(Path::new("Inkling-2-Mini-dspark-Q8_0.gguf"))),
+            Some(Path::new("mmproj-BF16.gguf")),
+            None,
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains("--served-model-name inkling-2-mini"));
+        assert!(joined.contains("--context 1048576"));
+        assert!(!joined.contains("--enable-yarn"));
+        assert!(joined.contains("--speculative dspark --dspark-model Inkling-2-Mini-dspark-Q8_0.gguf"));
+        assert!(joined.contains("--mmproj mmproj-BF16.gguf"));
+        assert!(args.contains(&"--extension".to_string()));
+        assert!(args.contains(&r"D:\Models\Inkling 2\ext.dll".to_string()));
+        assert!(args.contains(&"--log-level".to_string()));
+        assert!(args.contains(&"debug".to_string()));
+    }
+
+    #[test]
+    fn test_yarn_mode_auto_on_off() {
+        let auto_low = GufoServerConfig {
+            context: 131_072,
+            yarn_mode: "auto".to_string(),
+            ..Default::default()
+        };
+        assert!(!build_args(&auto_low, Path::new("m.gguf"), None, None, None)
+            .contains(&"--enable-yarn".to_string()));
+
+        let force_on = GufoServerConfig {
+            context: 65_536,
+            yarn_mode: "on".to_string(),
+            ..Default::default()
+        };
+        assert!(build_args(&force_on, Path::new("m.gguf"), None, None, None)
+            .contains(&"--enable-yarn".to_string()));
+
+        let force_off = GufoServerConfig {
+            context: 1_048_576,
+            yarn_mode: "off".to_string(),
+            ..Default::default()
+        };
+        assert!(!build_args(&force_off, Path::new("m.gguf"), None, None, None)
+            .contains(&"--enable-yarn".to_string()));
+    }
+
+    #[test]
+    fn test_split_cli_args_windows_paths_and_quotes() {
+        let parsed = split_cli_args(
+            r#"--flag-a "C:\Program Files\Gufo\ext.dll" --flag-b 'single quoted' --plain=123"#,
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                "--flag-a",
+                r"C:\Program Files\Gufo\ext.dll",
+                "--flag-b",
+                "single quoted",
+                "--plain=123",
+            ]
+        );
     }
 
     #[test]

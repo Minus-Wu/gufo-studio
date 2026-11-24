@@ -1,9 +1,31 @@
 export type ServerState = 'stopped' | 'starting' | 'running' | 'error';
 
+export type YarnMode = 'auto' | 'on' | 'off';
+export type SpeculativeMode = 'mtp' | 'dspark' | 'dflash2' | 'off';
+
+export interface ModelProfile {
+  id: string;
+  name: string;
+  model_path: string;
+  mtp_path: string;
+  dspark_path: string;
+  vision_path: string;
+  served_model_name: string;
+  context: number;
+  sessions: number;
+  think: 'off' | 'on' | 'auto';
+  temperature: number;
+  max_tokens: number;
+  speculative: SpeculativeMode;
+  yarn_mode: YarnMode;
+  extra_args: string;
+}
+
 export interface GufoServerConfig {
   gufo_path: string;
   model_path: string;
   mtp_path: string;
+  dspark_path: string;
   vision_path: string;
   served_model_name: string;
   host: string;
@@ -14,9 +36,13 @@ export interface GufoServerConfig {
   max_output_bytes: number;
   think: 'off' | 'on' | 'auto';
   temperature: number;
-  speculative: 'mtp' | 'dflash2' | 'off';
+  speculative: SpeculativeMode;
   mtp_policy: 'survival' | 'length';
   prompt_lookup: boolean;
+  yarn_mode: YarnMode;
+  extra_args: string;
+  model_profiles: ModelProfile[];
+  active_profile_id: string;
   api_key: string;
   auto_open_gui: boolean;
   auto_start_server: boolean;

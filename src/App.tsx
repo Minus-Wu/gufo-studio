@@ -72,6 +72,7 @@ export function App() {
       'models\\Qwen3.8-Flash-Next-GGUF\\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf',
     mtp_path:
       'models\\Qwen3.8-Flash-Next-GGUF\\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf',
+    dspark_path: '',
     vision_path: 'models\\Qwen3.8-Flash-Next-GGUF\\mmproj-BF16.gguf',
     served_model_name: 'flash-next',
     host: '0.0.0.0',
@@ -85,6 +86,10 @@ export function App() {
     speculative: 'mtp',
     mtp_policy: 'survival',
     prompt_lookup: true,
+    yarn_mode: 'auto',
+    extra_args: '',
+    model_profiles: [],
+    active_profile_id: '',
     api_key: '',
     auto_open_gui: true,
     auto_start_server: false,
