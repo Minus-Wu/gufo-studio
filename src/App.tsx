@@ -6,7 +6,7 @@ import './styles.css';
 import { Header } from './components/Header';
 import { ChatView } from './components/ChatView';
 import { RagView } from './components/RagView';
-import { ConfigView } from './components/ConfigView';
+import { ConfigSubTab, ConfigView } from './components/ConfigView';
 import { LogsView } from './components/LogsView';
 import {
   ActiveInferenceRequest,
@@ -15,10 +15,13 @@ import {
   KnowledgeBaseSummary,
   RagConfig,
   ServerStatus,
+  WebSearchConfig,
 } from './types';
+import { DEFAULT_WEB_SEARCH_CONFIG } from './utils/webSearchHelpers';
 
 export function App() {
   const [activeTab, setActiveTab] = useState<'chat' | 'rag' | 'config' | 'logs'>('chat');
+  const [configSubTab, setConfigSubTab] = useState<ConfigSubTab>('inference');
   const [isStarting, setIsStarting] = useState(false);
   const [metricsHistory, setMetricsHistory] = useState<InferenceMetrics[]>([]);
   const [activeRequest, setActiveRequest] = useState<ActiveInferenceRequest | null>(null);
@@ -41,6 +44,10 @@ export function App() {
     system_prompt_template:
       '請優先依據以下「檢索參考資料」回答使用者的問題。回答時若引用了資料內容，請以 [來源編號]（例如 [1]、[2]）標註出處；若參考資料不足以回答或與問題無關，請誠實說明，不要編造事實。\n\n【檢索參考資料】\n{{context}}',
   });
+
+  // WebSearch 狀態
+  const [webSearchEnabled, setWebSearchEnabled] = useState(false);
+  const [webSearchConfig, setWebSearchConfig] = useState<WebSearchConfig>(DEFAULT_WEB_SEARCH_CONFIG);
 
   const [status, setStatus] = useState<ServerStatus>({
     state: 'stopped',
@@ -135,15 +142,17 @@ export function App() {
           setMetricsHistory(recentMetrics);
         }
 
-        const [loadedRagCfg, loadedKbs] = await Promise.all([
+        const [loadedRagCfg, loadedKbs, loadedWebCfg] = await Promise.all([
           invoke<RagConfig>('rag_get_config'),
           invoke<KnowledgeBaseSummary[]>('rag_list_kbs'),
+          invoke<WebSearchConfig>('web_search_get_config'),
         ]);
         setRagConfig(loadedRagCfg);
         setKbList(loadedKbs);
         if (loadedKbs.length > 0) {
           setSelectedKbIds(loadedKbs.map((k) => k.id));
         }
+        setWebSearchConfig(loadedWebCfg);
       } catch (err) {
         console.error('初始化失敗:', err);
       }
@@ -286,6 +295,16 @@ export function App() {
     );
   };
 
+  const handleSaveWebSearchConfig = async (newCfg: WebSearchConfig) => {
+    const saved = await invoke<WebSearchConfig>('web_search_save_config', { config: newCfg });
+    setWebSearchConfig(saved);
+  };
+
+  const handleOpenWebSearchSettings = () => {
+    setConfigSubTab('web_search');
+    setActiveTab('config');
+  };
+
   return (
     <>
       <Header
@@ -319,6 +338,10 @@ export function App() {
             selectedKbIds={selectedKbIds}
             onToggleKbId={handleToggleKbId}
             onOpenRagTab={() => setActiveTab('rag')}
+            webSearchConfig={webSearchConfig}
+            webSearchEnabled={webSearchEnabled}
+            onToggleWebSearch={setWebSearchEnabled}
+            onOpenWebSearchSettings={handleOpenWebSearchSettings}
           />
         </div>
         {activeTab === 'rag' && (
@@ -336,6 +359,10 @@ export function App() {
             onSaveConfig={handleSaveConfig}
             onResetDefaults={handleResetDefaults}
             isRunning={status.state === 'running' || status.state === 'starting'}
+            webSearchConfig={webSearchConfig}
+            onSaveWebSearchConfig={handleSaveWebSearchConfig}
+            activeSubTab={configSubTab}
+            onSubTabChange={setConfigSubTab}
           />
         )}
         {activeTab === 'logs' && (

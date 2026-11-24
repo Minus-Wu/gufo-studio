@@ -18,6 +18,9 @@ import {
   ChevronDown,
   ChevronUp,
   AlertCircle,
+  Globe,
+  ExternalLink,
+  Loader2,
 } from 'lucide-react';
 import {
   ChatMessage,
@@ -28,8 +31,16 @@ import {
   RagSearchHit,
   RagSearchResponse,
   ServerStatus,
+  WebSearchConfig,
+  WebSearchHit,
+  WebSearchResponse,
 } from '../types';
 import { describeCacheMissReason, formatCacheSourceLabel } from '../utils/metricsFormat';
+import {
+  buildWebSearchPromptBlock,
+  formatWebProviderLabel,
+  openSafeExternalUrl,
+} from '../utils/webSearchHelpers';
 
 interface ChatViewProps {
   status: ServerStatus;
@@ -44,6 +55,10 @@ interface ChatViewProps {
   selectedKbIds: string[];
   onToggleKbId: (id: string) => void;
   onOpenRagTab: () => void;
+  webSearchConfig: WebSearchConfig;
+  webSearchEnabled: boolean;
+  onToggleWebSearch: (enabled: boolean) => void;
+  onOpenWebSearchSettings: () => void;
 }
 
 const round1 = (n: number) => Math.round(n * 10) / 10;
@@ -113,13 +128,17 @@ export const ChatView: React.FC<ChatViewProps> = ({
   selectedKbIds,
   onToggleKbId,
   onOpenRagTab,
+  webSearchConfig,
+  webSearchEnabled,
+  onToggleWebSearch,
+  onOpenWebSearchSettings,
 }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: 'welcome',
       role: 'assistant',
       content:
-        '你好！我是 **Gufo Studio**，本機以 AMD Strix Halo (Ryzen AI MAX+ 395) 硬體深度優化推論。\n\n目前預設支援 **Qwen3.8-Flash-Next (128K Vision)** 投機加速推論。你可以隨時傳送訊息、貼上圖片截圖，或是切換上方「知識庫 (RAG)」掛載本地文件進行問答！',
+        '你好！我是 **Gufo Studio**，本機以 AMD Strix Halo (Ryzen AI MAX+ 395) 硬體深度優化推論。\n\n目前預設支援 **Qwen3.8-Flash-Next (128K Vision)** 投機加速推論。你可以隨時傳送訊息、貼上圖片截圖，或是切換下方控制列開啟「知識庫 (RAG)」或「網路搜尋 (WebSearch)」！',
       timestamp: Date.now(),
       excludeFromContext: true,
     },
@@ -132,6 +151,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
   const [temperature, setTemperature] = useState(defaultTemperature);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [expandedCitations, setExpandedCitations] = useState<Record<string, boolean>>({});
+  const [expandedWebCitations, setExpandedWebCitations] = useState<Record<string, boolean>>({});
 
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
@@ -226,40 +246,16 @@ export const ChatView: React.FC<ChatViewProps> = ({
     setImages([]);
     setIsGenerating(true);
 
-    let ragHits: RagSearchHit[] = [];
-    let ragWarning: string | undefined;
-    let ragElapsedMs: number | undefined;
-    let augmentedUserText = trimmedInput;
-
-    if (ragEnabled && selectedKbIds.length > 0 && trimmedInput.length > 0) {
-      try {
-        const searchRes = await invoke<RagSearchResponse>('rag_search', {
-          kbIds: selectedKbIds,
-          query: trimmedInput,
-        });
-        ragHits = searchRes.hits || [];
-        ragWarning = searchRes.warning || undefined;
-        ragElapsedMs = searchRes.elapsed_ms;
-
-        if (ragHits.length > 0) {
-          const contextBlock = ragHits
-            .map(
-              (h, idx) =>
-                `[${idx + 1}] 來源：${h.doc_name}（知識庫：${h.kb_name}，切片 #${
-                  h.chunk_index + 1
-                }）\n${h.content}`
-            )
-            .join('\n\n---\n\n');
-          const tpl = ragConfig.system_prompt_template || '{{context}}';
-          const ragInstruction = tpl.includes('{{context}}')
-            ? tpl.replace('{{context}}', contextBlock)
-            : `${tpl}\n\n${contextBlock}`;
-          augmentedUserText = `${ragInstruction}\n\n【使用者問題】\n${trimmedInput}`;
-        }
-      } catch (err: any) {
-        ragWarning = `知識庫檢索失敗，本次改以原始問題送出：${err}`;
-      }
-    }
+    const shouldRunRag = ragEnabled && selectedKbIds.length > 0 && trimmedInput.length > 0;
+    const shouldRunWeb = webSearchEnabled && trimmedInput.length > 0;
+    const initialStatusNote =
+      shouldRunRag && shouldRunWeb
+        ? '正在檢索知識庫與搜尋網路...'
+        : shouldRunWeb
+        ? '正在搜尋網路並擷取參考內容...'
+        : shouldRunRag
+        ? '正在檢索本地知識庫...'
+        : undefined;
 
     const assistantMsgId = `asst-${Date.now()}`;
     const assistantMessage: ChatMessage = {
@@ -267,15 +263,121 @@ export const ChatView: React.FC<ChatViewProps> = ({
       role: 'assistant',
       content: '',
       timestamp: Date.now(),
-      ragHits: ragHits.length > 0 ? ragHits : undefined,
-      ragWarning,
-      ragElapsedMs,
+      statusNote: initialStatusNote,
     };
 
     setMessages([...newMessages, assistantMessage]);
 
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+
+    const patchAssistant = (patch: Partial<ChatMessage>) => {
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantMsgId ? { ...m, ...patch } : m))
+      );
+    };
+
+    let ragHits: RagSearchHit[] = [];
+    let ragWarning: string | undefined;
+    let ragElapsedMs: number | undefined;
+    let webHits: WebSearchHit[] = [];
+    let webProviderUsed: string | undefined;
+    let webWarning: string | undefined;
+    let webElapsedMs: number | undefined;
+    let augmentedUserText = trimmedInput;
+
+    if (shouldRunRag || shouldRunWeb) {
+      const ragTask = shouldRunRag
+        ? invoke<RagSearchResponse>('rag_search', {
+            kbIds: selectedKbIds,
+            query: trimmedInput,
+          })
+            .then((res) => ({ ok: true as const, res }))
+            .catch((err: any) => ({ ok: false as const, err: String(err) }))
+        : Promise.resolve(null);
+
+      const webTask = shouldRunWeb
+        ? invoke<WebSearchResponse>('web_search_query', {
+            query: trimmedInput,
+            configOverride: null,
+          })
+            .then((res) => ({ ok: true as const, res }))
+            .catch((err: any) => ({ ok: false as const, err: String(err) }))
+        : Promise.resolve(null);
+
+      const [ragOutcome, webOutcome] = await Promise.all([ragTask, webTask]);
+
+      if (abortController.signal.aborted) {
+        patchAssistant({
+          statusNote: undefined,
+          excludeFromContext: true,
+        });
+        setIsGenerating(false);
+        abortControllerRef.current = null;
+        return;
+      }
+
+      const prefixParts: string[] = [];
+
+      if (ragOutcome) {
+        if (ragOutcome.ok) {
+          ragHits = ragOutcome.res.hits || [];
+          ragWarning = ragOutcome.res.warning || undefined;
+          ragElapsedMs = ragOutcome.res.elapsed_ms;
+          if (ragHits.length > 0) {
+            const contextBlock = ragHits
+              .map(
+                (h, idx) =>
+                  `[${idx + 1}] 來源：${h.doc_name}（知識庫：${h.kb_name}，切片 #${
+                    h.chunk_index + 1
+                  }）\n${h.content}`
+              )
+              .join('\n\n---\n\n');
+            const tpl = ragConfig.system_prompt_template || '{{context}}';
+            const ragInstruction = tpl.includes('{{context}}')
+              ? tpl.replace('{{context}}', contextBlock)
+              : `${tpl}\n\n${contextBlock}`;
+            prefixParts.push(ragInstruction);
+          }
+        } else {
+          ragWarning = `知識庫檢索失敗：${ragOutcome.err}`;
+        }
+      }
+
+      if (webOutcome) {
+        if (webOutcome.ok) {
+          webHits = webOutcome.res.hits || [];
+          webProviderUsed = webOutcome.res.provider_used;
+          webWarning = webOutcome.res.warning || undefined;
+          webElapsedMs = webOutcome.res.elapsed_ms;
+          if (webHits.length > 0) {
+            prefixParts.push(buildWebSearchPromptBlock(webHits, webSearchConfig.prompt_template));
+          } else if (!webWarning) {
+            webWarning = '本次網路搜尋未找到相關結果，已改由模型直接回答。';
+          }
+        } else {
+          webWarning = `網路搜尋失敗，本次改以原始問題送出：${webOutcome.err}`;
+        }
+      }
+
+      if (prefixParts.length > 0) {
+        augmentedUserText = `${prefixParts.join('\n\n')}\n\n【使用者問題】\n${trimmedInput}`;
+      }
+
+      patchAssistant({
+        statusNote: undefined,
+        ragHits: ragHits.length > 0 ? ragHits : undefined,
+        ragWarning,
+        ragElapsedMs,
+        webHits: webHits.length > 0 ? webHits : undefined,
+        webProviderUsed,
+        webWarning,
+        webElapsedMs,
+      });
+    }
+
     // 格式化 OpenAI 對話歷史 (排除歡迎訊息、錯誤提示與空白回覆)
-    // 注意：僅對本次最新使用者訊息附加 RAG 檢索片段，既相容各種 chat template，也完整保留前面輪次的 KV 前綴快取
+    // 注意：僅對本次最新使用者訊息附加檢索片段，既相容各種 chat template，也完整保留前面輪次的 KV 前綴快取
     const apiMessages = newMessages
       .filter(
         (msg) =>
@@ -303,9 +405,6 @@ export const ChatView: React.FC<ChatViewProps> = ({
         return { role: msg.role, content: effectiveText };
       });
 
-    const abortController = new AbortController();
-    abortControllerRef.current = abortController;
-
     const startTime = performance.now();
     let firstTokenTime: number | null = null;
     let accumulatedContent = '';
@@ -314,12 +413,6 @@ export const ChatView: React.FC<ChatViewProps> = ({
     let finalTimings: any = null;
     let finalUsage: any = null;
     let frameHandle: number | null = null;
-
-    const patchAssistant = (patch: Partial<ChatMessage>) => {
-      setMessages((prev) =>
-        prev.map((m) => (m.id === assistantMsgId ? { ...m, ...patch } : m))
-      );
-    };
 
     // 以 requestAnimationFrame 節流 UI 更新，避免每個 token 都觸發 Markdown 重繪
     const scheduleFlush = () => {
@@ -621,6 +714,86 @@ export const ChatView: React.FC<ChatViewProps> = ({
               </div>
 
               <div className={`message-bubble ${msg.role === 'user' ? 'user-bubble' : ''}`}>
+                {/* 檢索 / 搜尋進行中狀態提示 */}
+                {msg.statusNote && !msg.content && !msg.reasoning && (
+                  <div className="chat-status-note">
+                    <Loader2 size={14} className="spin-icon" />
+                    <span>{msg.statusNote}</span>
+                  </div>
+                )}
+
+                {/* WebSearch 網路來源折疊區塊 */}
+                {(msg.webHits?.length || msg.webWarning) && (
+                  <div className="web-citation-box">
+                    <button
+                      type="button"
+                      className="web-citation-toggle"
+                      onClick={() =>
+                        setExpandedWebCitations((prev) => ({
+                          ...prev,
+                          [msg.id]: !prev[msg.id],
+                        }))
+                      }
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <Globe size={13} color="#34d399" />
+                        <span>
+                          {msg.webHits && msg.webHits.length > 0
+                            ? `已搜尋 ${msg.webHits.length} 筆網路來源${
+                                msg.webProviderUsed
+                                  ? ` · ${formatWebProviderLabel(msg.webProviderUsed)}`
+                                  : ''
+                              }${msg.webElapsedMs !== undefined ? ` (${msg.webElapsedMs}ms)` : ''}`
+                            : '網路搜尋提示'}
+                        </span>
+                      </div>
+                      {expandedWebCitations[msg.id] ? (
+                        <ChevronUp size={14} />
+                      ) : (
+                        <ChevronDown size={14} />
+                      )}
+                    </button>
+
+                    {msg.webWarning && (
+                      <div className="rag-citation-warn">
+                        <AlertCircle size={12} />
+                        <span>{msg.webWarning}</span>
+                      </div>
+                    )}
+
+                    {expandedWebCitations[msg.id] && msg.webHits && (
+                      <div className="rag-citation-list">
+                        {msg.webHits.map((hit, idx) => (
+                          <div key={`${hit.url}-${idx}`} className="rag-citation-item">
+                            <div className="rag-citation-item-head">
+                              <button
+                                type="button"
+                                className="web-hit-link"
+                                onClick={() => openSafeExternalUrl(hit.url)}
+                                title={hit.url}
+                              >
+                                <span>
+                                  [W{idx + 1}] {hit.title}
+                                </span>
+                                <ExternalLink size={11} />
+                              </button>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                                {hit.domain && <span className="rag-type-badge">{hit.domain}</span>}
+                                {hit.fetched_content && (
+                                  <span className="rag-citation-score">已擷取正文</span>
+                                )}
+                              </div>
+                            </div>
+                            <div className="rag-citation-snippet">
+                              {hit.fetched_content || hit.snippet}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {/* RAG 檢索來源折疊區塊 */}
                 {(msg.ragHits?.length || msg.ragWarning) && (
                   <div className="rag-citation-box">
@@ -758,6 +931,27 @@ export const ChatView: React.FC<ChatViewProps> = ({
           </div>
         )}
 
+        {/* WebSearch 狀態條 */}
+        {webSearchEnabled && (
+          <div className="chat-web-bar">
+            <span className="chat-rag-label">
+              <Globe size={12} color="#34d399" />
+              <span>
+                網路搜尋引擎：<strong>{formatWebProviderLabel(webSearchConfig.provider)}</strong>
+              </span>
+              <span className="chat-web-sub">
+                · 最多 {webSearchConfig.max_results} 筆
+                {webSearchConfig.fetch_page_content
+                  ? ` · 擷取前 ${webSearchConfig.fetch_top_n} 筆正文`
+                  : ' · 僅摘要'}
+              </span>
+            </span>
+            <button type="button" className="chat-rag-link" onClick={onOpenWebSearchSettings}>
+              引擎與測試設定
+            </button>
+          </div>
+        )}
+
         {/* 圖片預覽條 */}
         {images.length > 0 && (
           <div className="image-preview-strip">
@@ -787,6 +981,15 @@ export const ChatView: React.FC<ChatViewProps> = ({
                   ? `開啟 (${selectedKbIds.length}/${kbList.length})`
                   : '關閉'}
               </span>
+            </button>
+
+            <button
+              className={`toggle-btn ${webSearchEnabled ? 'active-web' : ''}`}
+              onClick={() => onToggleWebSearch(!webSearchEnabled)}
+              title="開啟後，發問前會先透過 WebSearch 引擎搜尋最新網頁資訊並附上引用"
+            >
+              <Globe size={14} />
+              <span>網路搜尋：{webSearchEnabled ? '開啟' : '關閉'}</span>
             </button>
 
             <button

@@ -3,6 +3,7 @@ use crate::rag::{
     EmbeddingTestResult, KnowledgeBaseDetail, KnowledgeBaseSummary, RagChunkPreview, RagConfig,
     RagImportResult, RagReindexResult, RagSearchResponse,
 };
+use crate::web_search::{WebSearchConfig, WebSearchResponse};
 use crate::AppState;
 use tauri::{AppHandle, State};
 
@@ -312,4 +313,28 @@ pub async fn rag_search(
     top_k: Option<u32>,
 ) -> Result<RagSearchResponse, String> {
     state.rag.search(kb_ids, query, top_k).await
+}
+
+// ── WebSearch 網路搜尋指令 ──
+
+#[tauri::command]
+pub async fn web_search_get_config(state: State<'_, AppState>) -> Result<WebSearchConfig, String> {
+    Ok(state.web_search.get_config().await)
+}
+
+#[tauri::command]
+pub async fn web_search_save_config(
+    state: State<'_, AppState>,
+    config: WebSearchConfig,
+) -> Result<WebSearchConfig, String> {
+    state.web_search.save_config(config).await
+}
+
+#[tauri::command]
+pub async fn web_search_query(
+    state: State<'_, AppState>,
+    query: String,
+    config_override: Option<WebSearchConfig>,
+) -> Result<WebSearchResponse, String> {
+    state.web_search.search(query, config_override).await
 }

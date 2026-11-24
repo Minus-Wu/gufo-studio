@@ -23,7 +23,10 @@ import {
   Globe,
   RefreshCw,
 } from 'lucide-react';
-import { GufoServerConfig, ServerStatus } from '../types';
+import { GufoServerConfig, ServerStatus, WebSearchConfig } from '../types';
+import { WebSearchSettingsView } from './WebSearchSettingsView';
+
+export type ConfigSubTab = 'inference' | 'preferences' | 'web_search' | 'api_guide';
 
 interface ConfigViewProps {
   config: GufoServerConfig;
@@ -31,6 +34,10 @@ interface ConfigViewProps {
   onSaveConfig: (newConfig: GufoServerConfig) => void;
   onResetDefaults: () => void;
   isRunning: boolean;
+  webSearchConfig: WebSearchConfig;
+  onSaveWebSearchConfig: (cfg: WebSearchConfig) => Promise<void>;
+  activeSubTab?: ConfigSubTab;
+  onSubTabChange?: (tab: ConfigSubTab) => void;
 }
 
 const GIB = 1024 ** 3;
@@ -60,8 +67,17 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
   onSaveConfig,
   onResetDefaults,
   isRunning,
+  webSearchConfig,
+  onSaveWebSearchConfig,
+  activeSubTab,
+  onSubTabChange,
 }) => {
-  const [subTab, setSubTab] = useState<'inference' | 'preferences' | 'api_guide'>('inference');
+  const [internalSubTab, setInternalSubTab] = useState<ConfigSubTab>('inference');
+  const subTab = activeSubTab ?? internalSubTab;
+  const setSubTab = (tab: ConfigSubTab) => {
+    setInternalSubTab(tab);
+    onSubTabChange?.(tab);
+  };
   const [form, setForm] = useState<GufoServerConfig>(initialConfig);
   const [pathStatus, setPathStatus] = useState<{ [key: string]: boolean }>({});
   const [savedSuccess, setSavedSuccess] = useState(false);
@@ -194,6 +210,14 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
               <Check size={12} /> 已即時保存
             </span>
           )}
+        </button>
+        <button
+          type="button"
+          className={`config-nav-btn ${subTab === 'web_search' ? 'active' : ''}`}
+          onClick={() => setSubTab('web_search')}
+        >
+          <Globe size={15} />
+          <span>網路搜尋 (WebSearch)</span>
         </button>
         <button
           type="button"
@@ -989,7 +1013,15 @@ export const ConfigView: React.FC<ConfigViewProps> = ({
         </>
       )}
 
-      {/* 分頁三：API 串接與效能速度指南 (API & Metrics) */}
+      {/* 分頁三：網路搜尋設定 (WebSearch) */}
+      {subTab === 'web_search' && (
+        <WebSearchSettingsView
+          config={webSearchConfig}
+          onSaveConfig={onSaveWebSearchConfig}
+        />
+      )}
+
+      {/* 分頁四：API 串接與效能速度指南 (API & Metrics) */}
       {subTab === 'api_guide' && (() => {
         const cleanHost = (form.host || '').trim().replace(/^\[|\]$/g, '');
         const isWildcard = cleanHost === '' || cleanHost === '0.0.0.0' || cleanHost === '::';

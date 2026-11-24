@@ -100,6 +100,11 @@ export interface ChatMessage {
   ragHits?: RagSearchHit[];
   ragWarning?: string;
   ragElapsedMs?: number;
+  webHits?: WebSearchHit[];
+  webProviderUsed?: string;
+  webWarning?: string;
+  webElapsedMs?: number;
+  statusNote?: string;
 }
 
 export interface ChatSession {
@@ -242,6 +247,45 @@ export interface RagSearchHit {
 export interface RagSearchResponse {
   hits: RagSearchHit[];
   used_embedding: boolean;
+  warning: string | null;
+  elapsed_ms: number;
+}
+
+export type WebSearchProvider =
+  | 'auto'
+  | 'duckduckgo'
+  | 'bing_rss'
+  | 'searxng'
+  | 'tavily'
+  | 'brave'
+  | 'serper';
+
+export interface WebSearchConfig {
+  provider: WebSearchProvider;
+  api_key: string;
+  searxng_url: string;
+  max_results: number;
+  fetch_page_content: boolean;
+  fetch_top_n: number;
+  max_page_chars: number;
+  timeout_secs: number;
+  region: string;
+  prompt_template: string;
+}
+
+export interface WebSearchHit {
+  title: string;
+  url: string;
+  domain: string;
+  snippet: string;
+  fetched_content?: string | null;
+  published_date?: string | null;
+}
+
+export interface WebSearchResponse {
+  query: string;
+  provider_used: string;
+  hits: WebSearchHit[];
   warning: string | null;
   elapsed_ms: number;
 }
